@@ -17,14 +17,25 @@ export default function ChatInput({ onSubmit, onVoiceSubmit }: ChatInputProps) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const longPressTimerRef = useRef<number | null>(null);
   const longPressTriggeredRef = useRef(false);
+  const submitGuardRef = useRef(false);
   const hasContent = value.trim().length > 0;
 
   const submit = () => {
+    if (submitGuardRef.current) return;
+    submitGuardRef.current = true;
+
     const content = value.trim();
-    if (!content) return;
+    if (!content) {
+      submitGuardRef.current = false;
+      return;
+    }
     onSubmit(content);
     setValue("");
     setReadOnly(true);
+
+    setTimeout(() => {
+      submitGuardRef.current = false;
+    }, 300);
   };
 
   const clearLongPressTimer = () => {

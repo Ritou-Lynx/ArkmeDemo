@@ -36,7 +36,7 @@ const defaultPreferences: PreferencesState = {
   themeMode: "system",
   accentColor: "green",
   appIcon: "classic",
-  localeCode: "",
+  localeCode: "zh_CN",
 };
 
 const storageKey = "arkme-demo.preferences";
@@ -80,6 +80,7 @@ export const accentColorOptions: Array<{
 const translations: Record<string, Record<TranslationKey, string>> = {
   "zh-CN": {
     "tabs.records": "快记",
+    "tabs.arrange": "\u5b89\u6392",
     "tabs.insight": "洞见",
     "tabs.mine": "我的",
     "search.close": "关闭搜索",
@@ -272,6 +273,7 @@ const translations: Record<string, Record<TranslationKey, string>> = {
   },
   "zh-TW": {
     "tabs.records": "快記",
+    "tabs.arrange": "???",
     "tabs.insight": "洞見",
     "tabs.mine": "我的",
     "search.close": "關閉搜尋",
@@ -464,6 +466,7 @@ const translations: Record<string, Record<TranslationKey, string>> = {
   },
   "en-US": {
     "tabs.records": "Notes",
+    "tabs.arrange": "Arrange",
     "tabs.insight": "Insight",
     "tabs.mine": "Me",
     "search.close": "Close search",
@@ -656,6 +659,7 @@ const translations: Record<string, Record<TranslationKey, string>> = {
   },
   "ar-SA": {
     "tabs.records": "ملاحظات",
+    "tabs.arrange": "\u062a\u0631\u062a\u064a\u0628",
     "tabs.insight": "رؤى",
     "tabs.mine": "أنا",
     "settings.title": "الإعدادات",
@@ -683,23 +687,6 @@ const translations: Record<string, Record<TranslationKey, string>> = {
   },
 };
 
-const localeAliases: Record<string, string> = {
-  zh: "zh-CN",
-  en: "en-US",
-  ar: "ar-SA",
-  de: "de-DE",
-  es: "es-ES",
-  fr: "fr-FR",
-  id: "id-ID",
-  it: "it-IT",
-  ja: "ja-JP",
-  ko: "ko-KR",
-  pt: "pt-BR",
-  ru: "ru-RU",
-  th: "th-TH",
-  tr: "tr-TR",
-  vi: "vi-VN",
-};
 
 function readStoredPreferences(): PreferencesState {
   if (typeof window === "undefined") return defaultPreferences;
@@ -743,11 +730,8 @@ function resolveLocale(localeCode: LocaleCode): string {
     return supportedLocales.find((option) => option.code === localeCode)?.locale ?? "zh-CN";
   }
 
-  if (typeof navigator === "undefined") return "zh-CN";
-  const browserLocale = navigator.language || "zh-CN";
-  const exactMatch = supportedLocales.find((option) => option.locale === browserLocale);
-  if (exactMatch?.locale) return exactMatch.locale;
-  return localeAliases[browserLocale.split("-")[0]] ?? "en-US";
+  // Demo 默认使用简体中文，不跟随浏览器语言
+  return "zh-CN";
 }
 
 function getLanguageDirection(locale: string): "ltr" | "rtl" {

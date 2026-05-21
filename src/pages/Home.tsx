@@ -31,6 +31,11 @@ import {
   type TestMessageSender,
 } from "@/data/testConversations";
 import { formatBubbleTime, formatTimeLabel } from "@/lib/time";
+import {
+  readLLMConfigFromStorage,
+  recognizeArrangementFromQuickNoteByLLM,
+  type RecognizeArrangementResult,
+} from "@/lib/llm";
 import { cn } from "@/lib/utils";
 import {
   accentColorOptions,
@@ -55,8 +60,86 @@ type TabItem = {
   key: PageType;
 };
 
+type ArrangementSourceContext = {
+  sourceType: "quick_note";
+  sourceText: string;
+  createdBy: "ai" | "mock";
+  createdAt: string;
+  recognizeResult: RecognizeArrangementResult;
+};
+
+type ArrangeSourceContext = string | ArrangementSourceContext;
+
+type ArrangeItem = {
+  id: string;
+  title: string;
+  date: string;
+  time?: string;
+  timeText?: string;
+  person?: string;
+  location?: string;
+  note?: string;
+  sourceContext?: ArrangeSourceContext;
+  completed: boolean;
+  dismissed: boolean;
+  completedAt?: string | null;
+};
+
+type LaterReason =
+  | "user_postponed"
+  | "no_time"
+  | "vague_ai_created"
+  | "auto_archived_overdue"
+  | "ai_created_later"
+  | "ai_specific_time_unresolved";
+
+type LaterItem = {
+  id: string;
+  title: string;
+  originalDate?: string;
+  originalTime?: string;
+  person?: string;
+  location?: string;
+  note?: string;
+  sourceContext?: ArrangeSourceContext;
+  laterReason: LaterReason;
+  laterAt: string;
+  completed: boolean;
+  completedAt?: string | null;
+};
+
+type LastArrangeAction = {
+  type: "delete";
+  item: ArrangeItem;
+  insertBeforeId: string | null;
+} | {
+  type: "later";
+  item: ArrangeItem;
+  insertBeforeId: string | null;
+  laterInsertBeforeId: string | null;
+} | {
+  type: "return_to_arrange";
+  laterItem: LaterItem;
+  laterInsertBeforeId: string | null;
+} | {
+  type: "delete_from_later";
+  laterItem: LaterItem;
+  laterInsertBeforeId: string | null;
+} | {
+  type: "complete_from_later";
+  laterItem: LaterItem;
+  laterInsertBeforeId: string | null;
+} | {
+  type: "create_arrange";
+  item: ArrangeItem;
+} | {
+  type: "create_later";
+  laterItem: LaterItem;
+} | null;
+
 const tabs: TabItem[] = [
   { key: "records" },
+  { key: "arrange" },
   { key: "insight" },
   { key: "mine" },
 ];
@@ -277,6 +360,416 @@ function persistSearchHistory(history: string[]) {
   }
 }
 
+function formatArrangeDateValue(date: Date) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function formatArrangeTimeValue(hours: number, minutes: number) {
+  return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}`;
+}
+
+function isClockTimeValue(value?: string | null): value is string {
+  return typeof value === "string" && /^\d{2}:\d{2}$/.test(value);
+}
+
+function normalizeClockTime(value?: string | null) {
+  return isClockTimeValue(value) ? value : undefined;
+}
+
+function getArrangeDateWithOffset(daysOffset: number, hours?: number, minutes?: number) {
+  const date = new Date();
+  date.setDate(date.getDate() + daysOffset);
+  date.setHours(hours ?? 9, minutes ?? 0, 0, 0);
+  return {
+    date: formatArrangeDateValue(date),
+    ...(hours !== undefined && minutes !== undefined
+      ? { time: formatArrangeTimeValue(hours, minutes) }
+      : {}),
+  };
+}
+
+function getNextWeekdayDate(targetDay: number, hours: number, minutes: number) {
+  const date = new Date();
+  const currentDay = date.getDay();
+  let diff = targetDay - currentDay;
+  if (diff <= 0) diff += 7;
+  if (diff < 7) diff += 7;
+  date.setDate(date.getDate() + diff);
+  date.setHours(hours, minutes, 0, 0);
+  return {
+    date: formatArrangeDateValue(date),
+    time: formatArrangeTimeValue(hours, minutes),
+  };
+}
+
+function getArrangeTimestamp(item: Pick<ArrangeItem, "date" | "time">) {
+  const fallbackTime = item.time ? `${item.time}:00` : "09:00:00";
+  return new Date(`${item.date}T${fallbackTime}`).getTime();
+}
+
+function getArrangeDayDifference(dateValue: string, referenceDate = new Date()) {
+  const target = new Date(`${dateValue}T00:00:00`);
+  const reference = new Date(referenceDate);
+  reference.setHours(0, 0, 0, 0);
+  return Math.round((target.getTime() - reference.getTime()) / (1000 * 60 * 60 * 24));
+}
+
+function getArrangeWeekdayLabel(dateValue: string) {
+  const weekdayLabels = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
+  return weekdayLabels[new Date(dateValue + "T00:00:00").getDay()] ?? dateValue;
+}
+
+function formatArrangeAxisPrimaryLabel(dateValue: string) {
+  const date = new Date(dateValue + "T00:00:00");
+  return String(date.getMonth() + 1) + "月" + String(date.getDate()) + "日";
+}
+
+function formatArrangeAxisSecondaryLabel(dateValue: string) {
+  const diff = getArrangeDayDifference(dateValue);
+  const weekday = getArrangeWeekdayLabel(dateValue);
+
+  if (diff === 0) return weekday + " · 今天";
+  if (diff === 1) return weekday + " · 明天";
+  if (diff === -1) return weekday + " · 昨天";
+  return weekday;
+}
+
+function getArrangeMetaParts(item: ArrangeItem) {
+  const parts: string[] = [];
+  if (item.timeText || item.time) parts.push(item.timeText ?? item.time ?? "");
+  if (item.person) parts.push(item.person);
+  if (item.location) parts.push(item.location);
+  return parts;
+}
+
+
+function formatLaterOriginalDateLabel(originalDate?: string, originalTime?: string): string {
+  if (!originalDate) return "无明确时间";
+  const d = new Date(originalDate + "T00:00:00");
+  const month = d.getMonth() + 1;
+  const day = d.getDate();
+  const base = month + "月" + day + "日";
+  return originalTime ? base + " " + originalTime : base;
+}
+
+function getInitialLaterItems(): LaterItem[] {
+  const now = new Date();
+  const ago = (h: number) => new Date(now.getTime() - h * 3600000).toISOString();
+  const pastDate = (d: number) => formatArrangeDateValue(new Date(now.getTime() - d * 86400000));
+  return [
+    {
+      id: "later-seed-1",
+      title: "整理上周的工作笔记",
+      originalDate: pastDate(8),
+      laterReason: "user_postponed",
+      laterAt: ago(1.5),
+      completed: false,
+      completedAt: null,
+    },
+    {
+      id: "later-seed-2",
+      title: "给张磊发邮件确认方案",
+      person: "张磊",
+      laterReason: "no_time",
+      laterAt: ago(6),
+      completed: false,
+      completedAt: null,
+    },
+    {
+      id: "later-seed-3",
+      title: "看完那篇关于团队绩效的文章",
+      laterReason: "vague_ai_created",
+      laterAt: ago(26),
+      completed: false,
+      completedAt: null,
+    },
+  ];
+}
+
+function getInitialArrangeItems(): ArrangeItem[] {
+  const threeDaysAgo = getArrangeDateWithOffset(-3);
+  const yesterday = getArrangeDateWithOffset(-1);
+  const todayAfternoon = getArrangeDateWithOffset(0, 14, 0);
+  const todayEvening = getArrangeDateWithOffset(0, 18, 30);
+  const tomorrow = getArrangeDateWithOffset(1, 10, 0);
+  const nextTuesday = getNextWeekdayDate(2, 15, 0);
+  const nextWednesday = getNextWeekdayDate(3, 11, 0);
+  const nextThursday = getNextWeekdayDate(4, 19, 30);
+  const nextMonday = getNextWeekdayDate(1, 9, 0);
+
+  return [
+    {
+      id: "arrange-past-1",
+      title: "上周五和王总确认预算",
+      date: threeDaysAgo.date,
+      person: "王总",
+      completed: false,
+      dismissed: false,
+      completedAt: null,
+    },
+    {
+      id: "arrange-past-2",
+      title: "给妈妈回电话",
+      date: yesterday.date,
+      person: "妈妈",
+      completed: false,
+      dismissed: false,
+      completedAt: null,
+    },
+    {
+      id: "arrange-today-1",
+      title: "和李泽过一遍排期草稿",
+      date: todayAfternoon.date,
+      time: todayAfternoon.time,
+      person: "李泽",
+      location: "会议室A",
+      completed: false,
+      dismissed: false,
+      completedAt: null,
+    },
+    {
+      id: "arrange-today-2",
+      title: "取快递",
+      date: todayEvening.date,
+      time: todayEvening.time,
+      completed: false,
+      dismissed: false,
+      completedAt: null,
+    },
+    {
+      id: "arrange-future-1",
+      title: "上午给妈妈打电话",
+      date: tomorrow.date,
+      time: tomorrow.time,
+      person: "妈妈",
+      completed: false,
+      dismissed: false,
+      completedAt: null,
+    },
+    {
+      id: "arrange-future-2",
+      title: "和设计师讨论方案",
+      date: nextTuesday.date,
+      time: nextTuesday.time,
+      person: "张磊",
+      location: "3楼咖啡厅",
+      completed: false,
+      dismissed: false,
+      completedAt: null,
+    },
+    {
+      id: "arrange-future-3",
+      title: "周三上午把版本风险过一遍",
+      date: nextWednesday.date,
+      time: nextWednesday.time,
+      person: "小林",
+      completed: false,
+      dismissed: false,
+      completedAt: null,
+    },
+    {
+      id: "arrange-future-4",
+      title: "周四晚上补一轮会议纪要",
+      date: nextThursday.date,
+      time: nextThursday.time,
+      location: "家里",
+      completed: false,
+      dismissed: false,
+      completedAt: null,
+    },
+    {
+      id: "arrange-future-5",
+      title: "下周一上午把里程碑更新给团队",
+      date: nextMonday.date,
+      time: nextMonday.time,
+      person: "项目组",
+      completed: false,
+      dismissed: false,
+      completedAt: null,
+    },
+  ];
+}
+
+type RecognizedArrangement = {
+  title: string;
+  date: string;
+  time?: string;
+  person?: string;
+  location?: string;
+  isVague: boolean;
+};
+
+function recognizeArrangementFromQuickNote(text: string): RecognizedArrangement | null {
+  const trimmed = text.trim();
+  if (!trimmed || trimmed.length > 200) return null;
+
+  const emotionOnly = /^[哈呵嘿嗯啊哦呀唉嘛吗呢吧了的啦噢哇嘻呃额嗨]+[!！。？?~～…]*$/;
+  if (emotionOnly.test(trimmed)) return null;
+
+  const chatPatterns = [
+    /^(好的|嗯嗯|谢谢|没事|算了|哈哈|好吧|行吧|可以|OK|ok|拜拜|再见|晚安|早安|你好|hello|hi|hey)[!！。？?~～…]*$/i,
+    /^[😀-🙏🤡-🤿🥰-🥶🦀-🦿🧀-🧿🩰-🩴🪀-🪆]+$/u,
+  ];
+  for (const p of chatPatterns) {
+    if (p.test(trimmed)) return null;
+  }
+
+  const now = new Date();
+
+  let dateOffset: number | null = null;
+  let hours: number | undefined;
+  let minutes: number | undefined;
+  let explicitDate: string | undefined;
+  let isVague = false;
+
+  if (/今天/.test(trimmed)) dateOffset = 0;
+  else if (/明天/.test(trimmed)) dateOffset = 1;
+  else if (/后天/.test(trimmed)) dateOffset = 2;
+
+  const monthDayMatch = /(\d{1,2})月(\d{1,2})[日号]/.exec(trimmed);
+  if (monthDayMatch) {
+    const month = Number(monthDayMatch[1]);
+    const day = Number(monthDayMatch[2]);
+    let year = now.getFullYear();
+    const candidate = new Date(year, month - 1, day);
+    if (candidate.getTime() < now.getTime() - 86400000) year++;
+    const m = String(month).padStart(2, "0");
+    const d = String(day).padStart(2, "0");
+    explicitDate = `${year}-${m}-${d}`;
+    dateOffset = null;
+  }
+
+  const weekdayPatterns: Array<[RegExp, number]> = [
+    [/(?:周|星期)一/, 1],
+    [/(?:周|星期)二/, 2],
+    [/(?:周|星期)三/, 3],
+    [/(?:周|星期)四/, 4],
+    [/(?:周|星期)五/, 5],
+    [/(?:周|星期)六/, 6],
+    [/(?:周|星期)[日天]/, 0],
+  ];
+  for (const [pattern, day] of weekdayPatterns) {
+    if (pattern.test(trimmed) && dateOffset === null && !explicitDate) {
+      const currentDay = now.getDay();
+      let diff = day - currentDay;
+      if (diff <= 0) diff += 7;
+      dateOffset = diff;
+      break;
+    }
+  }
+
+  const timePointMatch = /(\d{1,2})\s*[:：点]\s*(\d{1,2})?(?:\s*分)?/.exec(trimmed);
+  if (timePointMatch) {
+    let h = Number(timePointMatch[1]);
+    const m = timePointMatch[2] ? Number(timePointMatch[2]) : 0;
+    if (/下午|晚上|晚/.test(trimmed) && h >= 1 && h <= 11) h += 12;
+    if (/上午|早上|早/.test(trimmed) && h === 12) h = 0;
+    hours = h;
+    minutes = m;
+  } else {
+    if (/早上|早/.test(trimmed) && !/早安/.test(trimmed)) { hours = 8; minutes = 0; }
+    else if (/上午/.test(trimmed)) { hours = 10; minutes = 0; }
+    else if (/中午/.test(trimmed)) { hours = 12; minutes = 0; }
+    else if (/下午/.test(trimmed)) { hours = 14; minutes = 0; }
+    else if (/晚上|晚/.test(trimmed) && !/晚安/.test(trimmed)) { hours = 19; minutes = 0; }
+  }
+
+  const vaguePatterns = /有空|找时间|改天|抽空|回头|以后/;
+  if (vaguePatterns.test(trimmed) && dateOffset === null && !explicitDate) {
+    isVague = true;
+  }
+
+  const hasDateInfo = dateOffset !== null || explicitDate !== undefined;
+  const hasTimeInfo = hours !== undefined;
+  const actionPatterns = /[去做买吃喝看打发送写拿取跑走回约见交提问开带|办理|处理|整理|准备|确认|回复|联系|检查|完成|提交|汇报|报告|安排|讨论|沟通|练|学|读|听|试|修|换|洗|收|寄|借|还|挂|订|预约|签|交|缴|充|付|报名|注册|申请|面试|体检]/;
+  const hasAction = actionPatterns.test(trimmed);
+
+  if (!hasDateInfo && !hasTimeInfo && !isVague && !hasAction) return null;
+  if (!hasDateInfo && !hasTimeInfo && !isVague) return null;
+
+  let finalDate: string;
+  if (explicitDate) {
+    finalDate = explicitDate;
+  } else if (dateOffset !== null) {
+    const d = new Date(now);
+    d.setDate(d.getDate() + dateOffset);
+    finalDate = formatArrangeDateValue(d);
+  } else if (isVague) {
+    finalDate = "";
+  } else if (hasTimeInfo) {
+    finalDate = formatArrangeDateValue(now);
+  } else {
+    return null;
+  }
+
+  let person: string | undefined;
+  const personMatch = /[和跟与]([^\s,，。!！?？]{1,5}?)(?:一起)?(?:吃饭|见面|开会|聊聊|聊天|讨论|商量|碰面|碰头|约|聚|通话|视频|打电话|聚餐|喝酒|喝咖啡|喝茶)/.exec(trimmed);
+  if (personMatch) {
+    person = personMatch[1];
+  }
+
+  let location: string | undefined;
+  const locationMatch = /(?:去|到|在)([^\s,，。!！?？和跟与]{1,8}?)(?:[,，。!！?？\s]|$)/.exec(trimmed);
+  if (locationMatch && !personMatch) {
+    const loc = locationMatch[1];
+    if (!/今天|明天|后天|下午|上午|晚上|早上|中午/.test(loc) && loc.length >= 2) {
+      location = loc;
+    }
+  }
+
+  let title = trimmed;
+  title = title.replace(/^(今天|明天|后天)\s*/, "");
+  title = title.replace(/^(上午|下午|晚上|早上|中午)\s*/, "");
+  title = title.replace(/(\d{1,2})\s*[:：点]\s*(\d{1,2})?\s*(分)?\s*/, "");
+  title = title.replace(/(\d{1,2})月(\d{1,2})[日号]\s*/, "");
+  title = title.replace(/(?:周|星期)[一二三四五六日天]\s*/, "");
+  title = title.trim();
+  if (!title) title = trimmed;
+
+  return {
+    title,
+    date: finalDate,
+    time: hours !== undefined && minutes !== undefined ? formatArrangeTimeValue(hours, minutes) : undefined,
+    person,
+    location,
+    isVague,
+  };
+}
+
+function convertMockRecognizedArrangement(
+  recognized: RecognizedArrangement
+): RecognizeArrangementResult {
+  const shouldCreate = Boolean(recognized.title);
+  const target = recognized.isVague || !recognized.date ? "later" : "timeline";
+  return {
+    shouldCreate,
+    confidence: recognized.isVague ? "medium" : "high",
+    title: recognized.title,
+    timeType: recognized.isVague ? "vague" : recognized.date ? "specific" : "none",
+    date: recognized.date || null,
+    timeText: recognized.time ?? null,
+    person: recognized.person ?? null,
+    location: recognized.location ?? null,
+    note: null,
+    target: shouldCreate ? target : "none",
+    reason: "useMockRecognition 开启，使用本地规则识别",
+  };
+}
+
+function getLaterReasonFromRecognition(result: RecognizeArrangementResult): LaterReason {
+  if (result.reason === "ai_specific_time_unresolved") return "ai_specific_time_unresolved";
+  if (result.timeType === "vague") return "vague_ai_created";
+  if (result.timeType === "none") return "no_time";
+  return "ai_created_later";
+}
+
+function isArrangementSourceContext(value: ArrangeSourceContext): value is ArrangementSourceContext {
+  return typeof value !== "string";
+}
+
 function parseAiConversationTimestamp(value: string, fallbackTime: number) {
   const match =
     /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})/.exec(value);
@@ -335,6 +828,17 @@ export default function Home({ currentPage, onNavigate }: HomeProps) {
   const [showAiConversation, setShowAiConversation] = React.useState(false);
   const [showSendToSelf, setShowSendToSelf] = React.useState(false);
   const [showTestConversation, setShowTestConversation] = React.useState(false);
+  const [arrangeItems, setArrangeItems] = React.useState(getInitialArrangeItems);
+
+  const [laterItems, setLaterItems] = React.useState(getInitialLaterItems);
+  const [showLaterPage, setShowLaterPage] = React.useState(false);
+  const [arrangeSheetId, setArrangeSheetId] = React.useState<string | null>(null);
+  const [laterSheetId, setLaterSheetId] = React.useState<string | null>(null);
+  const [arrangeExpandedCompletedDates, setArrangeExpandedCompletedDates] = React.useState<string[]>([]);
+  const [arrangeRecentlyCompletedIds, setArrangeRecentlyCompletedIds] = React.useState<string[]>([]);
+  const [lastArrangeAction, setLastArrangeAction] = React.useState<LastArrangeAction>(null);
+  const [arrangeToast, setArrangeToast] = React.useState<{ message: string; key: number } | null>(null);
+  const arrangeToastTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
   const [conversationReturnContext, setConversationReturnContext] =
     React.useState<ConversationReturnContext>({ mode: "drawer" });
   const [aiConversationTargetIndex, setAiConversationTargetIndex] =
@@ -363,6 +867,236 @@ export default function Home({ currentPage, onNavigate }: HomeProps) {
     React.useState<TestReadState>(getInitialTestReadState);
   const initializedBrowserNotificationMessagesRef = React.useRef(false);
   const browserNotifiedMessageIdsRef = React.useRef<Set<string>>(new Set());
+  const previousPageRef = React.useRef<PageType>(currentPage);
+
+  const arrangeSheetItem = React.useMemo(
+    () => arrangeItems.find((item) => item.id === arrangeSheetId) ?? null,
+    [arrangeSheetId, arrangeItems]
+  );
+
+  const laterSheetItem = React.useMemo(
+    () => laterItems.find((item) => item.id === laterSheetId) ?? null,
+    [laterSheetId, laterItems]
+  );
+
+  // 过去超过3条未完成安排：最新3条留在时间轴，更早的自动收起
+  const autoArchivedPastIds = React.useMemo(() => {
+    const pastIncomplete = arrangeItems
+      .filter((item) => !item.completed && !item.dismissed && getArrangeDayDifference(item.date) < 0)
+      .sort((a, b) => getArrangeTimestamp(b) - getArrangeTimestamp(a));
+    return new Set(pastIncomplete.slice(3).map((item) => item.id));
+  }, [arrangeItems]);
+
+  // currentCompleted 传入调用方当前的 completed 值，避免依赖 updater 异步副作用
+  const toggleArrangeCompleted = React.useCallback((id: string, currentCompleted: boolean) => {
+    const nextCompleted = !currentCompleted;
+    setArrangeItems((items) =>
+      items.map((item) => {
+        if (item.id !== id) return item;
+        return {
+          ...item,
+          completed: nextCompleted,
+          completedAt: nextCompleted ? new Date().toISOString() : null,
+        };
+      })
+    );
+    setArrangeRecentlyCompletedIds((ids) => (ids.includes(id) ? ids : [...ids, id]));
+  }, []);
+
+  const completeArrangeToToday = React.useCallback((id: string) => {
+    const today = formatArrangeDateValue(new Date());
+    setArrangeItems((items) =>
+      items.map((item) => {
+        if (item.id !== id) return item;
+        return { ...item, completed: true, date: today, completedAt: new Date().toISOString() };
+      })
+    );
+    setArrangeRecentlyCompletedIds((ids) => (ids.includes(id) ? ids : [...ids, id]));
+  }, []);
+
+  const showArrangeToast = React.useCallback((message: string) => {
+    if (arrangeToastTimerRef.current) clearTimeout(arrangeToastTimerRef.current);
+    setArrangeToast({ message, key: Date.now() });
+    arrangeToastTimerRef.current = setTimeout(() => setArrangeToast(null), 4000);
+  }, []);
+
+  const dismissArrangeItemFromTimeline = React.useCallback(
+    (item: ArrangeItem, insertBeforeId: string | null, type: "delete" | "later") => {
+      setArrangeItems((prev) => prev.filter((it) => it.id !== item.id));
+      setArrangeRecentlyCompletedIds((ids) => ids.filter((id) => id !== item.id));
+      setArrangeExpandedCompletedDates((dates) => dates.filter((d) => d !== item.date));
+      if (type === "later") {
+        const laterItem: LaterItem = {
+          id: item.id,
+          title: item.title,
+          originalDate: item.date,
+          originalTime: item.time,
+          person: item.person,
+          location: item.location,
+          note: item.note,
+          sourceContext: item.sourceContext,
+          laterReason: "user_postponed",
+          laterAt: new Date().toISOString(),
+          completed: false,
+          completedAt: null,
+        };
+        setLaterItems((prev) => [laterItem, ...prev]);
+        setLastArrangeAction({ type: "later", item, insertBeforeId, laterInsertBeforeId: null });
+      } else {
+        setLastArrangeAction({ type: "delete", item, insertBeforeId });
+      }
+      showArrangeToast(type === "delete" ? "已删除 · 撤销" : "以后再说 · 撤销");
+    },
+    [showArrangeToast]
+  );
+
+  const deleteArrangeItem = React.useCallback(
+    (item: ArrangeItem, insertBeforeId: string | null) => {
+      setArrangeSheetId(null);
+      dismissArrangeItemFromTimeline(item, insertBeforeId, "delete");
+    },
+    [dismissArrangeItemFromTimeline]
+  );
+
+  const moveArrangeItemToLater = React.useCallback(
+    (item: ArrangeItem, insertBeforeId: string | null) => {
+      setArrangeSheetId(null);
+      dismissArrangeItemFromTimeline(item, insertBeforeId, "later");
+    },
+    [dismissArrangeItemFromTimeline]
+  );
+
+  const deleteLaterItem = React.useCallback(
+    (laterItem: LaterItem, laterInsertBeforeId: string | null) => {
+      setLaterSheetId(null);
+      setLaterItems((prev) => prev.filter((it) => it.id !== laterItem.id));
+      setLastArrangeAction({ type: "delete_from_later", laterItem, laterInsertBeforeId });
+      showArrangeToast("已删除 · 撤销");
+    },
+    [showArrangeToast]
+  );
+
+  const returnLaterItemToArrange = React.useCallback(
+    (laterItem: LaterItem, newDate: string, newTime?: string) => {
+      setLaterSheetId(null);
+      setLaterItems((prev) => prev.filter((it) => it.id !== laterItem.id));
+      const arrangeItem: ArrangeItem = {
+        id: laterItem.id,
+        title: laterItem.title,
+        date: newDate,
+        time: normalizeClockTime(newTime),
+        timeText: newTime,
+        person: laterItem.person,
+        location: laterItem.location,
+        note: laterItem.note,
+        sourceContext: laterItem.sourceContext,
+        completed: false,
+        dismissed: false,
+        completedAt: null,
+      };
+      setArrangeItems((prev) => [...prev, arrangeItem]);
+      setLastArrangeAction({ type: "return_to_arrange", laterItem, laterInsertBeforeId: null });
+      showArrangeToast("已放回安排 · 撤销");
+    },
+    [showArrangeToast]
+  );
+
+  const completeLaterItem = React.useCallback(
+    (laterItem: LaterItem, laterInsertBeforeId: string | null, completeDate?: string) => {
+      setLaterItems((prev) => prev.filter((it) => it.id !== laterItem.id));
+      const dateToUse = completeDate ?? formatArrangeDateValue(new Date());
+      const arrangeItem: ArrangeItem = {
+        id: laterItem.id,
+        title: laterItem.title,
+        date: dateToUse,
+        timeText: laterItem.originalTime,
+        person: laterItem.person,
+        location: laterItem.location,
+        note: laterItem.note,
+        sourceContext: laterItem.sourceContext,
+        completed: true,
+        dismissed: false,
+        completedAt: new Date().toISOString(),
+      };
+      setArrangeItems((prev) => [...prev, arrangeItem]);
+      setArrangeRecentlyCompletedIds((ids) => (ids.includes(laterItem.id) ? ids : [...ids, laterItem.id]));
+      setLastArrangeAction({ type: "complete_from_later", laterItem, laterInsertBeforeId });
+      showArrangeToast("已完成 · 撤销");
+    },
+    [showArrangeToast]
+  );
+
+  const updateLaterItem = React.useCallback((id: string, patch: Partial<LaterItem>) => {
+    setLaterItems((items) =>
+      items.map((item) => (item.id === id ? { ...item, ...patch } : item))
+    );
+  }, []);
+
+  const undoLastArrangeAction = React.useCallback(() => {
+    if (!lastArrangeAction) return;
+    const action = lastArrangeAction;
+
+    if (action.type === "delete" || action.type === "later") {
+      setArrangeItems((prev) => {
+        const id = action.insertBeforeId;
+        if (!id) return [...prev, action.item];
+        const idx = prev.findIndex((it) => it.id === id);
+        if (idx < 0) return [...prev, action.item];
+        return [...prev.slice(0, idx), action.item, ...prev.slice(idx)];
+      });
+      if (action.type === "later") {
+        setLaterItems((prev) => prev.filter((it) => it.id !== action.item.id));
+      }
+    } else if (action.type === "return_to_arrange") {
+      setArrangeItems((prev) => prev.filter((it) => it.id !== action.laterItem.id));
+      setLaterItems((prev) => [action.laterItem, ...prev]);
+    } else if (action.type === "delete_from_later") {
+      setLaterItems((prev) => {
+        const id = action.laterInsertBeforeId;
+        if (!id) return [...prev, action.laterItem];
+        const idx = prev.findIndex((it) => it.id === id);
+        if (idx < 0) return [...prev, action.laterItem];
+        return [...prev.slice(0, idx), action.laterItem, ...prev.slice(idx)];
+      });
+    } else if (action.type === "complete_from_later") {
+      setArrangeItems((prev) => prev.filter((it) => it.id !== action.laterItem.id));
+      setArrangeRecentlyCompletedIds((ids) => ids.filter((id) => id !== action.laterItem.id));
+      setLaterItems((prev) => {
+        const id = action.laterInsertBeforeId;
+        if (!id) return [...prev, action.laterItem];
+        const idx = prev.findIndex((it) => it.id === id);
+        if (idx < 0) return [...prev, action.laterItem];
+        return [...prev.slice(0, idx), action.laterItem, ...prev.slice(idx)];
+      });
+    } else if (action.type === "create_arrange") {
+      setArrangeItems((prev) => prev.filter((it) => it.id !== action.item.id));
+      setArrangeRecentlyCompletedIds((ids) => ids.filter((id) => id !== action.item.id));
+    } else if (action.type === "create_later") {
+      setLaterItems((prev) => prev.filter((it) => it.id !== action.laterItem.id));
+    }
+
+    setLastArrangeAction(null);
+    if (arrangeToastTimerRef.current) clearTimeout(arrangeToastTimerRef.current);
+    setArrangeToast(null);
+  }, [lastArrangeAction]);
+
+  const updateArrangeItem = React.useCallback((id: string, patch: Partial<ArrangeItem>) => {
+    setArrangeItems((items) =>
+      items.map((item) => (item.id === id ? { ...item, ...patch } : item))
+    );
+  }, []);
+
+  React.useEffect(() => {
+    if (currentPage === "arrange" && previousPageRef.current !== "arrange") {
+      setArrangeExpandedCompletedDates([]);
+      setArrangeRecentlyCompletedIds([]);
+    }
+    if (currentPage !== "arrange" && previousPageRef.current === "arrange") {
+      setArrangeRecentlyCompletedIds([]);
+      setArrangeSheetId(null);
+    }
+    previousPageRef.current = currentPage;
+  }, [currentPage]);
 
   const unreadAiConversationCount = Math.max(
     0,
@@ -757,6 +1491,145 @@ export default function Home({ currentPage, onNavigate }: HomeProps) {
     });
   }, []);
 
+  const createArrangementFromQuickNote = React.useCallback(
+    async (content: string) => {
+      const config = readLLMConfigFromStorage();
+
+      if (!config.useMockRecognition) {
+        const result = await recognizeArrangementFromQuickNoteByLLM(content, config);
+
+        if (result.reason === "missing_llm_config") {
+          showArrangeToast("请先配置 AI 接口");
+          return;
+        }
+        if (result.reason === "provider_not_implemented") {
+          showArrangeToast("当前 AI Provider 暂未支持");
+          return;
+        }
+        if (result.reason === "api_request_failed") {
+          showArrangeToast("识别失败，请稍后再试");
+          return;
+        }
+        if (result.reason === "json_parse_failed") {
+          showArrangeToast("AI 返回格式异常，请重试");
+          return;
+        }
+        if (result.reason === "empty_llm_response") {
+          showArrangeToast("AI 返回为空，请重试");
+          return;
+        }
+
+        if (!result.shouldCreate || result.target === "none") {
+          console.debug("[arrange] Quick note recognition skipped creation.", result);
+          return;
+        }
+
+        const now = new Date();
+        const id = `arrange-qn-${now.getTime()}`;
+        const sourceContext: ArrangementSourceContext = {
+          sourceType: "quick_note",
+          sourceText: content,
+          createdBy: "ai",
+          createdAt: now.toISOString(),
+          recognizeResult: result,
+        };
+        const title = result.title.trim() || content.trim() || "新安排";
+
+        if (result.target === "timeline" && result.date) {
+          const arrangeItem: ArrangeItem = {
+            id,
+            title,
+            date: result.date,
+            time: normalizeClockTime(result.timeText),
+            timeText: result.timeText ?? undefined,
+            person: result.person ?? undefined,
+            location: result.location ?? undefined,
+            note: result.note ?? undefined,
+            sourceContext,
+            completed: false,
+            dismissed: false,
+            completedAt: null,
+          };
+          setArrangeItems((prev) => [...prev, arrangeItem]);
+          setLastArrangeAction({ type: "create_arrange", item: arrangeItem });
+          showArrangeToast("已添加到安排 · 撤销");
+          return;
+        }
+
+        const laterItem: LaterItem = {
+          id,
+          title,
+          originalDate: result.date ?? undefined,
+          originalTime: result.timeText ?? undefined,
+          person: result.person ?? undefined,
+          location: result.location ?? undefined,
+          note: result.note ?? undefined,
+          sourceContext,
+          laterReason:
+            result.target === "timeline" && !result.date
+              ? "ai_specific_time_unresolved"
+              : getLaterReasonFromRecognition(result),
+          laterAt: now.toISOString(),
+          completed: false,
+          completedAt: null,
+        };
+        setLaterItems((prev) => [laterItem, ...prev]);
+        setLastArrangeAction({ type: "create_later", laterItem });
+        showArrangeToast("已放入以后再说 · 撤销");
+        return;
+      }
+
+      const recognized = recognizeArrangementFromQuickNote(content);
+      if (!recognized) return;
+
+      const now = new Date();
+      const result = convertMockRecognizedArrangement(recognized);
+      const id = `arrange-qn-${now.getTime()}`;
+      const sourceContext: ArrangementSourceContext = {
+        sourceType: "quick_note",
+        sourceText: content,
+        createdBy: "mock",
+        createdAt: now.toISOString(),
+        recognizeResult: result,
+      };
+
+      if (recognized.isVague || !recognized.date) {
+        const laterItem: LaterItem = {
+          id,
+          title: recognized.title,
+          person: recognized.person,
+          location: recognized.location,
+          sourceContext,
+          laterReason: "vague_ai_created",
+          laterAt: now.toISOString(),
+          completed: false,
+          completedAt: null,
+        };
+        setLaterItems((prev) => [laterItem, ...prev]);
+        showArrangeToast("已识别为安排 → 以后再说");
+        return;
+      }
+
+      const arrangeItem: ArrangeItem = {
+        id,
+        title: recognized.title,
+        date: recognized.date,
+        time: recognized.time,
+        timeText: recognized.time,
+        person: recognized.person,
+        location: recognized.location,
+        sourceContext,
+        completed: false,
+        dismissed: false,
+        completedAt: null,
+      };
+      setArrangeItems((prev) => [...prev, arrangeItem]);
+      setLastArrangeAction({ type: "create_arrange", item: arrangeItem });
+      showArrangeToast("已识别为安排 → 时间轴");
+    },
+    [showArrangeToast]
+  );
+
   const createSelfRecord = React.useCallback((content: string) => {
     const timestamp = Date.now();
     setCreatedSelfRecords((prev) => {
@@ -773,7 +1646,8 @@ export default function Home({ currentPage, onNavigate }: HomeProps) {
       persistCreatedSelfRecords(nextRecords);
       return nextRecords;
     });
-  }, []);
+    void createArrangementFromQuickNote(content);
+  }, [createArrangementFromQuickNote]);
 
   const createRecordExtension = React.useCallback((parentRecord: RecordItem, content: string) => {
     const timestamp = Date.now();
@@ -1167,6 +2041,127 @@ export default function Home({ currentPage, onNavigate }: HomeProps) {
           onOpenSettings={() => setSettingsView("settings")}
           onOpenAbout={() => setSettingsView("about")}
         />
+      );
+    }
+
+    if (currentPage === "arrange") {
+      const toastNode = arrangeToast ? (
+        <ArrangeToast
+          key={arrangeToast.key}
+          message={arrangeToast.message}
+          onUndo={undoLastArrangeAction}
+          onDismiss={() => {
+            if (arrangeToastTimerRef.current) clearTimeout(arrangeToastTimerRef.current);
+            setArrangeToast(null);
+          }}
+        />
+      ) : null;
+
+      return (
+        <div className="relative flex h-full flex-col overflow-hidden">
+          {/* ── 共享 Tab 栏：始终静止，不参与滑动 ── */}
+          <header className="flex h-12 shrink-0 items-center justify-center bg-[linear-gradient(180deg,var(--primary-soft)_0%,var(--primary-soft)_100%)] px-4">
+            <div className="flex items-center gap-0.5 rounded-full bg-black/[0.06] p-1 dark:bg-white/[0.08]">
+              <button
+                type="button"
+                onClick={() => setShowLaterPage(false)}
+                className={
+                  !showLaterPage
+                    ? "rounded-full bg-bg px-4 py-1.5 text-[13px] font-semibold text-text shadow-[0_1px_3px_rgba(0,0,0,0.10)] transition-all"
+                    : "rounded-full px-4 py-1.5 text-[13px] font-medium text-text-muted transition-all active:opacity-70"
+                }
+              >
+                {"时间轴"}
+              </button>
+              <button
+                type="button"
+                onClick={() => setShowLaterPage(true)}
+                className={
+                  showLaterPage
+                    ? "rounded-full bg-bg px-4 py-1.5 text-[13px] font-semibold text-text shadow-[0_1px_3px_rgba(0,0,0,0.10)] transition-all"
+                    : "rounded-full px-4 py-1.5 text-[13px] font-medium text-text-muted transition-all active:opacity-70"
+                }
+              >
+                {"以后再说"}
+              </button>
+              <button
+                type="button"
+                disabled
+                className="cursor-default rounded-full px-4 py-1.5 text-[13px] font-medium text-text-muted/35"
+              >
+                {"日历"}
+              </button>
+            </div>
+          </header>
+
+          {/* ── 内容区：仅此部分平移 ── */}
+          <div className="relative min-h-0 flex-1 overflow-hidden">
+            <div
+              className="flex h-full transition-transform duration-[320ms] ease-[cubic-bezier(0.32,0.72,0,1)]"
+              style={{
+                width: "200%",
+                transform: showLaterPage ? "translateX(-50%)" : "translateX(0)",
+              }}
+            >
+              {/* 时间轴面板 */}
+              <div className="h-full overflow-hidden" style={{ width: "50%" }}>
+                <ArrangePreview
+                  items={arrangeItems}
+                  autoArchivedPastIds={autoArchivedPastIds}
+                  expandedCompletedDates={arrangeExpandedCompletedDates}
+                  recentlyCompletedIds={arrangeRecentlyCompletedIds}
+                  onToggleCompleted={toggleArrangeCompleted}
+                  onCompleteToday={completeArrangeToToday}
+                  onDelete={deleteArrangeItem}
+                  onLater={moveArrangeItemToLater}
+                  onOpenSheet={setArrangeSheetId}
+                  onToggleCompletedDate={(date) =>
+                    setArrangeExpandedCompletedDates((dates) =>
+                      dates.includes(date)
+                        ? dates.filter((itemDate) => itemDate !== date)
+                        : [...dates, date]
+                    )
+                  }
+                  onReleaseRecentlyCompleted={(id) =>
+                    setArrangeRecentlyCompletedIds((ids) => ids.filter((itemId) => itemId !== id))
+                  }
+                />
+              </div>
+
+              {/* 以后再说面板 */}
+              <div className="h-full overflow-hidden" style={{ width: "50%" }}>
+                <LaterPage
+                  items={laterItems}
+                  onOpenSheet={(id) => setLaterSheetId(id)}
+                  onDelete={(item, insertBeforeId) => deleteLaterItem(item, insertBeforeId)}
+                  onReturnToArrange={(item, date, time) => returnLaterItemToArrange(item, date, time)}
+                  onComplete={(item, insertBeforeId, completeDate) => completeLaterItem(item, insertBeforeId, completeDate)}
+                />
+              </div>
+            </div>
+          </div>
+
+          {/* ── 弹窗与 toast：在轮播层之外，覆盖全屏 ── */}
+          {arrangeSheetItem && (
+            <ArrangeBottomSheet
+              item={arrangeSheetItem}
+              onChange={(patch) => updateArrangeItem(arrangeSheetItem.id, patch)}
+              onClose={() => setArrangeSheetId(null)}
+              onDelete={() => deleteArrangeItem(arrangeSheetItem, null)}
+              onLater={() => moveArrangeItemToLater(arrangeSheetItem, null)}
+            />
+          )}
+          {laterSheetItem && (
+            <LaterBottomSheet
+              item={laterSheetItem}
+              onChange={(patch) => updateLaterItem(laterSheetItem.id, patch)}
+              onClose={() => setLaterSheetId(null)}
+              onDelete={() => deleteLaterItem(laterSheetItem, null)}
+              onReturnToArrange={(date, time) => returnLaterItemToArrange(laterSheetItem, date, time)}
+            />
+          )}
+          {toastNode}
+        </div>
       );
     }
 
@@ -2691,18 +3686,1098 @@ function MobileBottomNavigation({
               type="button"
               onClick={() => onNavigate(tab.key)}
               className={cn(
-                "flex h-full flex-1 items-center justify-center rounded-[10px] text-base transition active:scale-[0.98]",
+                "flex h-full flex-1 flex-col items-center justify-center gap-0.5 rounded-[10px] transition active:scale-[0.98]",
                 active
                   ? "font-semibold text-text"
                   : "font-normal text-text-tertiary"
               )}
             >
-              {getTabLabel(tab.key, t)}
+              <TabIcon page={tab.key} active={active} />
+              <span className="text-[13px] leading-4">{getTabLabel(tab.key, t)}</span>
             </button>
           );
         })}
       </div>
     </nav>
+  );
+}
+
+function ArrangePreview({
+  items,
+  autoArchivedPastIds,
+  expandedCompletedDates,
+  recentlyCompletedIds,
+  onToggleCompleted,
+  onCompleteToday,
+  onDelete,
+  onLater,
+  onOpenSheet,
+  onToggleCompletedDate,
+  onReleaseRecentlyCompleted,
+}: {
+  items: ArrangeItem[];
+  autoArchivedPastIds: Set<string>;
+  expandedCompletedDates: string[];
+  recentlyCompletedIds: string[];
+  onToggleCompleted: (id: string, currentCompleted: boolean) => void;
+  onCompleteToday: (id: string) => void;
+  onDelete: (item: ArrangeItem, insertBeforeId: string | null) => void;
+  onLater: (item: ArrangeItem, insertBeforeId: string | null) => void;
+  onOpenSheet: (id: string) => void;
+  onToggleCompletedDate: (date: string) => void;
+  onReleaseRecentlyCompleted: (id: string) => void;
+}) {
+  const scrollRef = React.useRef<HTMLDivElement | null>(null);
+  const todayRef = React.useRef<HTMLDivElement | null>(null);
+  const todayDate = formatArrangeDateValue(new Date());
+
+  const visibleItems = React.useMemo(
+    () =>
+      items
+        .filter((item) => !item.dismissed && !autoArchivedPastIds.has(item.id))
+        .slice()
+        .sort((a, b) => getArrangeTimestamp(a) - getArrangeTimestamp(b)),
+    [items, autoArchivedPastIds]
+  );
+
+  const handleCardDelete = React.useCallback(
+    (id: string) => {
+      const idx = visibleItems.findIndex((it) => it.id === id);
+      if (idx < 0) return;
+      onDelete(visibleItems[idx], visibleItems[idx + 1]?.id ?? null);
+    },
+    [visibleItems, onDelete]
+  );
+
+  const handleCardLater = React.useCallback(
+    (id: string) => {
+      const idx = visibleItems.findIndex((it) => it.id === id);
+      if (idx < 0) return;
+      onLater(visibleItems[idx], visibleItems[idx + 1]?.id ?? null);
+    },
+    [visibleItems, onLater]
+  );
+
+  const dayGroups = React.useMemo(() => {
+    const grouped = new Map<string, ArrangeItem[]>();
+
+    visibleItems.forEach((item) => {
+      const bucket = grouped.get(item.date) ?? [];
+      bucket.push(item);
+      grouped.set(item.date, bucket);
+    });
+
+    return Array.from(grouped.entries())
+      .sort((left, right) => getArrangeTimestamp({ date: left[0] }) - getArrangeTimestamp({ date: right[0] }))
+      .map(([date, dateItems]) => ({
+        date,
+        activeItems: dateItems.filter((item) => !item.completed),
+        completedItems: dateItems.filter((item) => item.completed),
+      }));
+  }, [visibleItems]);
+
+  React.useEffect(() => {
+    const container = scrollRef.current;
+    const todayNode = todayRef.current;
+    if (!container || !todayNode) return;
+
+    const target = Math.max(0, todayNode.offsetTop - container.clientHeight * 0.01);
+    requestAnimationFrame(() => {
+      container.scrollTo({ top: target, behavior: "auto" });
+    });
+  }, []);
+
+  React.useEffect(() => {
+    const container = scrollRef.current;
+    if (!container || recentlyCompletedIds.length === 0) return;
+
+    const checkVisibility = () => {
+      const containerRect = container.getBoundingClientRect();
+      recentlyCompletedIds.forEach((id) => {
+        const card = container.querySelector('[data-arrange-card-id="' + id + '"]');
+        if (!(card instanceof HTMLElement)) return;
+        const rect = card.getBoundingClientRect();
+        const stillVisible = rect.bottom > containerRect.top && rect.top < containerRect.bottom;
+        if (!stillVisible) onReleaseRecentlyCompleted(id);
+      });
+    };
+
+    container.addEventListener('scroll', checkVisibility, { passive: true });
+    window.addEventListener('resize', checkVisibility);
+    return () => {
+      container.removeEventListener('scroll', checkVisibility);
+      window.removeEventListener('resize', checkVisibility);
+    };
+  }, [recentlyCompletedIds, onReleaseRecentlyCompleted]);
+
+  return (
+    <div className="flex h-full flex-col bg-[linear-gradient(180deg,var(--primary-soft)_0%,var(--bg)_18%,var(--bg)_100%)]">
+      {autoArchivedPastIds.size > 0 && (
+        <div className="mx-auto w-full max-w-[430px] px-4 pb-1">
+          <p className="text-[11px] text-text-muted/50">{"早些时候的安排已收起"}</p>
+        </div>
+      )}
+
+      <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto pb-16">
+        <div className="relative mx-auto min-h-full max-w-[430px] px-4 pb-10 pt-4">
+          <div className="pointer-events-none absolute bottom-0 left-[40px] top-0 z-0 w-px bg-primary opacity-30" />
+
+          <div className="relative z-10 space-y-3 pt-5">
+            {dayGroups.map((group) => {
+              const isExpanded = expandedCompletedDates.includes(group.date);
+              const recentCompletedItems = group.completedItems.filter((item) =>
+                recentlyCompletedIds.includes(item.id)
+              );
+              const visibleDayItems = isExpanded
+                ? [...group.activeItems, ...group.completedItems]
+                : [...group.activeItems, ...recentCompletedItems];
+              // 隐藏的已完成数量 = 全部已完成 - 刚完成仍可见的（recentlyCompleted）
+              const hiddenCompletedCount = isExpanded ? 0 : group.completedItems.length - recentCompletedItems.length;
+              const dayDiff = getArrangeDayDifference(group.date);
+              // 有折叠内容时显示"已完成 n 项"，展开时显示"收起已完成"
+              const hasToggle = isExpanded ? group.completedItems.length > 0 : hiddenCompletedCount > 0;
+
+              return (
+                <section
+                  key={group.date}
+                  ref={group.date === todayDate ? todayRef : undefined}
+                  className="relative pl-[42px]"
+                >
+                  <div className="relative flex min-h-4 items-center justify-between gap-2.5">
+                    <div className="absolute left-[-18px] top-1/2 z-10 flex h-4 w-4 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full border border-primary/30 bg-bg">
+                      <div className="h-1.5 w-1.5 rounded-full bg-primary" />
+                    </div>
+                    <p className="min-w-0 text-[11px] font-medium leading-4 text-text">
+                      {formatArrangeAxisPrimaryLabel(group.date) + " / " + formatArrangeAxisSecondaryLabel(group.date)}
+                    </p>
+                    {hasToggle && (
+                      <button
+                        type="button"
+                        onClick={() => onToggleCompletedDate(group.date)}
+                        className="shrink-0 rounded-full border border-border bg-surface-2 px-2.5 py-1 text-[10px] leading-4 text-text-muted transition hover:bg-border"
+                      >
+                        {hiddenCompletedCount > 0
+                          ? "已完成 " + hiddenCompletedCount + " 项"
+                          : "收起已完成"}
+                      </button>
+                    )}
+                  </div>
+
+                  {visibleDayItems.length > 0 && (
+                    <div className="mt-1.5 space-y-1.5">
+                      {visibleDayItems.map((item) => (
+                        <ArrangeTimelineCard
+                          key={item.id}
+                          item={item}
+                          dayDiff={dayDiff}
+                          isRecentlyCompleted={recentlyCompletedIds.includes(item.id)}
+                          onToggleCompleted={onToggleCompleted}
+                          onCompleteToday={onCompleteToday}
+                          onDelete={() => handleCardDelete(item.id)}
+                          onLater={() => handleCardLater(item.id)}
+                          onOpenSheet={() => onOpenSheet(item.id)}
+                        />
+                      ))}
+                    </div>
+                  )}
+                </section>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ArrangeTimelineCard({
+  item,
+  dayDiff,
+  isRecentlyCompleted,
+  onToggleCompleted,
+  onCompleteToday,
+  onDelete,
+  onLater,
+  onOpenSheet,
+}: {
+  item: ArrangeItem;
+  dayDiff: number;
+  isRecentlyCompleted: boolean;
+  onToggleCompleted: (id: string, currentCompleted: boolean) => void;
+  onCompleteToday: (id: string) => void;
+  onDelete: () => void;
+  onLater: () => void;
+  onOpenSheet: () => void;
+}) {
+  const isPast = dayDiff < 0;
+  const isFuture = dayDiff > 0;
+  const [dragX, setDragX] = React.useState(0);
+  const [isRemoving, setIsRemoving] = React.useState(false);
+  const [showPastBubble, setShowPastBubble] = React.useState(false);
+  const [bubbleStyle, setBubbleStyle] = React.useState<React.CSSProperties>({});
+  const bubbleRef = React.useRef<HTMLDivElement>(null);
+  const removeTimeoutRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pointerStateRef = React.useRef<{
+    pointerId: number;
+    startX: number;
+    startY: number;
+    dragging: boolean;
+  } | null>(null);
+  const suppressClickRef = React.useRef(false);
+  const metaParts = getArrangeMetaParts(item);
+  const canSwipeLater = !item.completed;
+  const swipeHintOpacity = canSwipeLater ? Math.min(1, Math.abs(dragX) / 96) : 0;
+  const showLeftHint = dragX > 0;
+  const showRightHint = dragX < 0;
+
+  React.useEffect(() => {
+    if (!showPastBubble) return;
+    const handlePointerDown = (e: PointerEvent) => {
+      if (bubbleRef.current && !bubbleRef.current.contains(e.target as Node)) {
+        setShowPastBubble(false);
+      }
+    };
+    document.addEventListener("pointerdown", handlePointerDown);
+    return () => document.removeEventListener("pointerdown", handlePointerDown);
+  }, [showPastBubble]);
+
+  React.useEffect(() => {
+    return () => {
+      if (removeTimeoutRef.current) clearTimeout(removeTimeoutRef.current);
+    };
+  }, []);
+
+  const resetDrag = React.useCallback(() => {
+    pointerStateRef.current = null;
+    setDragX(0);
+  }, []);
+
+  const triggerSwipe = React.useCallback(
+    (direction: number) => {
+      setIsRemoving(true);
+      setDragX(direction > 0 ? 420 : -420);
+      removeTimeoutRef.current = setTimeout(() => {
+        if (direction > 0) onDelete();
+        else onLater();
+      }, 180);
+    },
+    [onDelete, onLater]
+  );
+
+  return (
+    <div className="relative">
+      {showPastBubble && (
+        <div
+          ref={bubbleRef}
+          style={bubbleStyle}
+          className="flex items-center gap-1 rounded-2xl border border-primary/15 bg-surface px-1.5 py-1.5 shadow-soft"
+        >
+          <button
+            type="button"
+            onClick={() => { onToggleCompleted(item.id, false); setShowPastBubble(false); }}
+            className="rounded-xl px-3 py-1.5 text-[12px] text-text-muted transition hover:bg-surface-2 active:scale-[0.97]"
+          >
+            {"当时完成"}
+          </button>
+          <button
+            type="button"
+            onClick={() => { onCompleteToday(item.id); setShowPastBubble(false); }}
+            className="rounded-xl bg-primary/10 px-3 py-1.5 text-[12px] text-primary transition hover:bg-primary/15 active:scale-[0.97]"
+          >
+            {"今天完成"}
+          </button>
+        </div>
+      )}
+      <div className="relative overflow-hidden rounded-[16px]">
+      {canSwipeLater && (
+        <>
+          {/* 右滑 = 删除，灰色背景 */}
+          <div
+            className="absolute inset-0 rounded-[16px] bg-surface-2"
+            style={{ opacity: showLeftHint ? swipeHintOpacity : 0 }}
+          />
+          {/* 左滑 = 以后再说，浅绿背景 */}
+          <div
+            className="absolute inset-0 rounded-[16px] bg-[#d6f0dd]"
+            style={{ opacity: showRightHint ? swipeHintOpacity : 0 }}
+          />
+          <div className="absolute inset-0 flex items-center justify-between px-4 text-sm">
+            <span className={cn("transition-opacity duration-150 text-text-muted", showLeftHint ? "opacity-100" : "opacity-0")}>
+              {"删除"}
+            </span>
+            <span className={cn("transition-opacity duration-150 text-[#5a9e72]", showRightHint ? "opacity-100" : "opacity-0")}>
+              {"以后再说"}
+            </span>
+          </div>
+        </>
+      )}
+      <article
+        data-arrange-card-id={item.id}
+        role="button"
+        tabIndex={0}
+        onClick={() => {
+          if (suppressClickRef.current) {
+            suppressClickRef.current = false;
+            return;
+          }
+          onOpenSheet();
+        }}
+        onKeyDown={(event) => {
+          if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            onOpenSheet();
+          }
+        }}
+        onPointerDown={(event) => {
+          if (isRemoving || !canSwipeLater) return;
+          pointerStateRef.current = {
+            pointerId: event.pointerId,
+            startX: event.clientX,
+            startY: event.clientY,
+            dragging: false,
+          };
+        }}
+        onPointerMove={(event) => {
+          const state = pointerStateRef.current;
+          if (!state || state.pointerId !== event.pointerId || isRemoving || !canSwipeLater) return;
+          const dx = event.clientX - state.startX;
+          const dy = event.clientY - state.startY;
+          if (!state.dragging && Math.abs(dx) > 8 && Math.abs(dx) > Math.abs(dy)) {
+            state.dragging = true;
+          }
+          if (state.dragging) {
+            suppressClickRef.current = true;
+            setDragX(Math.max(-140, Math.min(140, dx)));
+          }
+        }}
+        onPointerUp={(event) => {
+          const state = pointerStateRef.current;
+          if (!state || state.pointerId !== event.pointerId || isRemoving || !canSwipeLater) return;
+          const dx = event.clientX - state.startX;
+          if (state.dragging && Math.abs(dx) > 72) {
+            triggerSwipe(dx);
+          } else {
+            setDragX(0);
+          }
+          pointerStateRef.current = null;
+        }}
+        onPointerCancel={resetDrag}
+        className={cn(
+          "relative w-full rounded-[16px] border border-primary/10 bg-surface px-4 py-2.5 shadow-soft outline-none transition-[transform,opacity] duration-[180ms] focus-visible:ring-2 focus-visible:ring-primary/20",
+          isPast ? "opacity-[0.45]" : "opacity-100",
+          item.completed && !isRecentlyCompleted && "opacity-75",
+          isRemoving && "pointer-events-none"
+        )}
+        style={{ transform: dragX ? 'translateX(' + dragX + 'px)' : undefined, touchAction: "pan-y" }}
+      >
+        <div className="flex items-start gap-2.5">
+          <button
+            type="button"
+            aria-label={item.completed ? "取消完成" : "标记完成"}
+            onClick={(event) => {
+              event.stopPropagation();
+              if (item.completed) {
+                // 反勾：直接取消完成，不弹浮层
+                onToggleCompleted(item.id, item.completed);
+                setShowPastBubble(false);
+                return;
+              }
+              if (isFuture) {
+                // 未来任务：自动移到今天完成
+                onCompleteToday(item.id);
+              } else if (isPast) {
+                // 过去任务：fixed 定位气泡，避免被 overflow 容器裁切
+                const r = event.currentTarget.getBoundingClientRect();
+                const bubbleH = 52;
+                const gap = 8;
+                if (r.top > bubbleH + gap + 56) {
+                  setBubbleStyle({ position: "fixed", left: r.left, top: r.top - bubbleH - gap, zIndex: 300 });
+                } else {
+                  setBubbleStyle({ position: "fixed", left: r.left, top: r.bottom + gap, zIndex: 300 });
+                }
+                setShowPastBubble(true);
+              } else {
+                // 今天任务：直接完成
+                onToggleCompleted(item.id, item.completed);
+              }
+            }}
+            className={cn(
+              "mt-0.5 flex h-[17px] w-[17px] shrink-0 items-center justify-center rounded-[4px] border transition active:scale-[0.97]",
+              item.completed
+                ? "border-primary bg-primary text-on-primary"
+                : "border-border-strong bg-bg text-transparent hover:border-text-muted"
+            )}
+          >
+            <svg width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <path d="M3.5 8.5 6.5 11.5 12.5 4.5" />
+            </svg>
+          </button>
+
+          <div className="min-w-0 flex-1">
+            <h2 className={cn("text-[14px] font-medium leading-[1.45] text-text", item.completed && "line-through decoration-text-muted/80 decoration-[1.5px]")}>
+              {item.title}
+            </h2>
+            {metaParts.length > 0 && (
+              <div className="mt-1 flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-[11px] leading-4 text-text-muted">
+                {metaParts.map((part, index) => (
+                  <React.Fragment key={item.id + '-' + part}>
+                    {index > 0 && <span aria-hidden="true">{"·"}</span>}
+                    <span>{part}</span>
+                  </React.Fragment>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      </article>
+      </div>
+    </div>
+  );
+}
+
+function ArrangeSourceContextBlock({
+  sourceContext,
+  labelClass,
+}: {
+  sourceContext: ArrangeSourceContext;
+  labelClass: string;
+}) {
+  if (isArrangementSourceContext(sourceContext)) {
+    return (
+      <div className="py-3">
+        <div className={labelClass}>{"来源"}</div>
+        <p className="text-[13px] font-medium text-text">{"快记"}</p>
+        <p className="mt-1 text-[13px] leading-relaxed text-text-muted">
+          {"“" + sourceContext.sourceText + "”"}
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="py-3">
+      <div className={labelClass}>{"来源上下文"}</div>
+      <p className="text-[13px] leading-relaxed text-text-muted">{sourceContext}</p>
+    </div>
+  );
+}
+
+function ArrangeBottomSheet({
+  item,
+  onChange,
+  onClose,
+  onDelete,
+  onLater,
+}: {
+  item: ArrangeItem;
+  onChange: (patch: Partial<ArrangeItem>) => void;
+  onClose: () => void;
+  onDelete: () => void;
+  onLater: () => void;
+}) {
+  const fieldClass = "w-full bg-transparent text-[14px] text-text outline-none placeholder:text-text-muted/40";
+  const labelClass = "mb-1 text-[10px] font-semibold uppercase tracking-wider text-text-muted/60";
+
+  return (
+    <>
+      <div className="absolute inset-0 z-30 bg-black/25" onClick={onClose} />
+      <div className="absolute inset-0 z-40 flex items-center justify-center px-4 py-10">
+      <div className="flex w-full max-h-full flex-col rounded-[20px] bg-bg shadow-[0_8px_32px_rgba(0,0,0,0.18)]">
+
+        {/* \u6807\u9898\u680f */}
+        <div className="flex shrink-0 items-center justify-between px-5 pb-3 pt-4">
+          <h2 className="text-[16px] font-semibold text-text">{"\u5b89\u6392\u8be6\u60c5"}</h2>
+          <button
+            type="button"
+            onClick={onClose}
+            className="flex h-7 w-7 items-center justify-center rounded-full bg-surface-2 text-text-muted transition active:scale-95"
+          >
+            <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round">
+              <path d="M4 4L12 12M12 4L4 12" />
+            </svg>
+          </button>
+        </div>
+
+        {/* \u53ef\u6eda\u52a8\u5b57\u6bb5\u533a */}
+        <div className="min-h-0 flex-1 overflow-y-auto px-5 pb-2">
+          {/* \u6807\u9898 */}
+          <div className="border-b border-border/50 py-3">
+            <div className={labelClass}>{"\u6807\u9898"}</div>
+            <input
+              value={item.title}
+              onChange={(e) => onChange({ title: e.target.value })}
+              className={fieldClass + " text-[15px] font-medium"}
+              placeholder={"\u5b89\u6392\u6807\u9898"}
+            />
+          </div>
+
+          {/* \u65e5\u671f + \u65f6\u95f4 */}
+          <div className="grid grid-cols-2 gap-4 border-b border-border/50 py-3">
+            <div>
+              <div className={labelClass}>{"\u65e5\u671f"}</div>
+              <input
+                type="date"
+                value={item.date}
+                onChange={(e) => onChange({ date: e.target.value })}
+                className={fieldClass}
+              />
+            </div>
+            <div>
+              <div className={labelClass}>{"\u65f6\u95f4"}</div>
+              <input
+                type="time"
+                value={item.time ?? ""}
+                onChange={(e) => onChange({ time: e.target.value || undefined })}
+                className={fieldClass}
+              />
+            </div>
+          </div>
+
+          {/* \u5173\u8054\u4eba */}
+          <div className="border-b border-border/50 py-3">
+            <div className={labelClass}>{"\u5173\u8054\u4eba"}</div>
+            <input
+              value={item.person ?? ""}
+              onChange={(e) => onChange({ person: e.target.value || undefined })}
+              className={fieldClass}
+              placeholder={"\u65e0"}
+            />
+          </div>
+
+          {/* \u5730\u70b9 */}
+          <div className="border-b border-border/50 py-3">
+            <div className={labelClass}>{"\u5730\u70b9"}</div>
+            <input
+              value={item.location ?? ""}
+              onChange={(e) => onChange({ location: e.target.value || undefined })}
+              className={fieldClass}
+              placeholder={"\u65e0"}
+            />
+          </div>
+
+          {/* \u5907\u6ce8 */}
+          <div className={item.sourceContext ? "border-b border-border/50 py-3" : "py-3"}>
+            <div className={labelClass}>{"\u5907\u6ce8"}</div>
+            <textarea
+              value={item.note ?? ""}
+              onChange={(e) => onChange({ note: e.target.value || undefined })}
+              rows={3}
+              className={fieldClass + " resize-none leading-relaxed"}
+              placeholder={"\u6dfb\u52a0\u5907\u6ce8\u2026"}
+            />
+          </div>
+
+          {/* \u6765\u6e90\u4e0a\u4e0b\u6587\uff08\u53ea\u8bfb\uff0c\u6709\u5185\u5bb9\u624d\u663e\u793a\uff09 */}
+          {item.sourceContext && (
+            <ArrangeSourceContextBlock sourceContext={item.sourceContext} labelClass={labelClass} />
+          )}
+        </div>
+
+        {/* \u56fa\u5b9a\u5e95\u90e8\u64cd\u4f5c\u680f */}
+        <div className="flex shrink-0 items-center justify-between border-t border-border/50 px-8 py-4">
+          <button
+            type="button"
+            onClick={onDelete}
+            className="text-[14px] text-text-muted/70 transition active:scale-95"
+          >
+            {"\u5220\u9664"}
+          </button>
+          <button
+            type="button"
+            onClick={onLater}
+            className="text-[14px] text-[#5a9e72] transition active:scale-95"
+          >
+            {"\u4ee5\u540e\u518d\u8bf4"}
+          </button>
+        </div>
+      </div>
+      </div>
+    </>
+  );
+}
+
+// ─── LaterPage ────────────────────────────────────────────────────────────────
+
+function LaterPage({
+  items,
+  onOpenSheet,
+  onDelete,
+  onReturnToArrange,
+  onComplete,
+}: {
+  items: LaterItem[];
+  onOpenSheet: (id: string) => void;
+  onDelete: (item: LaterItem, insertBeforeId: string | null) => void;
+  onReturnToArrange: (item: LaterItem, date: string, time?: string) => void;
+  onComplete: (item: LaterItem, insertBeforeId: string | null, completeDate?: string) => void;
+}) {
+  const sorted = React.useMemo(
+    () => [...items].sort((a, b) => (b.laterAt > a.laterAt ? 1 : -1)),
+    [items]
+  );
+
+  const handleDelete = React.useCallback(
+    (id: string) => {
+      const idx = sorted.findIndex((it) => it.id === id);
+      if (idx < 0) return;
+      onDelete(sorted[idx], sorted[idx + 1]?.id ?? null);
+    },
+    [sorted, onDelete]
+  );
+
+  const handleReturnToArrange = React.useCallback(
+    (id: string, date: string, time?: string) => {
+      const item = sorted.find((it) => it.id === id);
+      if (!item) return;
+      onReturnToArrange(item, date, time);
+    },
+    [sorted, onReturnToArrange]
+  );
+
+  const handleComplete = React.useCallback(
+    (id: string, completeDate?: string) => {
+      const idx = sorted.findIndex((it) => it.id === id);
+      if (idx < 0) return;
+      onComplete(sorted[idx], sorted[idx + 1]?.id ?? null, completeDate);
+    },
+    [sorted, onComplete]
+  );
+
+  return (
+    <div className="flex h-full flex-col bg-[linear-gradient(180deg,var(--primary-soft)_0%,var(--bg)_18%,var(--bg)_100%)]">
+      {/* 列表 */}
+      <div className="min-h-0 flex-1 overflow-y-auto pb-16">
+        {sorted.length === 0 ? (
+          <div className="flex flex-col items-center justify-center px-8 pt-24 text-center">
+            <p className="text-[15px] font-medium text-text-muted/60">{"暂时没有放在这里的安排"}</p>
+            <p className="mt-1.5 text-[12px] text-text-muted/40">{"左滑安排卡片可以把它放到这里"}</p>
+          </div>
+        ) : (
+          <div className="mx-auto max-w-[430px] space-y-2 px-4 pt-3">
+            {sorted.map((item) => (
+              <LaterListCard
+                key={item.id}
+                item={item}
+                onComplete={handleComplete}
+                onDelete={handleDelete}
+                onReturnToArrange={handleReturnToArrange}
+                onOpenSheet={() => onOpenSheet(item.id)}
+              />
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─── LaterListCard ─────────────────────────────────────────────────────────────
+
+function LaterListCard({
+  item,
+  onComplete,
+  onDelete,
+  onReturnToArrange,
+  onOpenSheet,
+}: {
+  item: LaterItem;
+  onComplete: (id: string, completeDate?: string) => void;
+  onDelete: (id: string) => void;
+  onReturnToArrange: (id: string, date: string, time?: string) => void;
+  onOpenSheet: () => void;
+}) {
+  // ─── swipe state ───
+  const [dragX, setDragX] = React.useState(0);
+  const [snapped, setSnapped] = React.useState(false);   // 左滑"卡住"状态
+  const [isRemoving, setIsRemoving] = React.useState(false);
+  // ─── past-completion bubble ───
+  const [showCompleteBubble, setShowCompleteBubble] = React.useState(false);
+  const [bubbleStyle, setBubbleStyle] = React.useState<React.CSSProperties>({});
+  const bubbleRef = React.useRef<HTMLDivElement>(null);
+
+  const removeTimeoutRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pointerStateRef = React.useRef<{
+    pointerId: number;
+    startX: number;
+    startY: number;
+    startDragX: number;
+    dragging: boolean;
+  } | null>(null);
+  const suppressClickRef = React.useRef(false);
+
+  // 按钮区宽度（今天＋明天＋选时间 + gap + 右padding）
+  const BUTTON_AREA = 196;
+  const SNAP_THRESHOLD = 56;   // 左滑超过此距离→卡住
+  const CLOSE_THRESHOLD = 40;  // 卡住后右滑超过此距离→回弹
+  const DELETE_THRESHOLD = 72; // 右滑超过此距离→删除
+
+  const isPast = !!item.originalDate && getArrangeDayDifference(item.originalDate) < 0;
+  const today = formatArrangeDateValue(new Date());
+  const tomorrow = formatArrangeDateValue(new Date(Date.now() + 86400000));
+
+  // 关闭完成气泡（点击外部）
+  React.useEffect(() => {
+    if (!showCompleteBubble) return;
+    const handle = (e: PointerEvent) => {
+      if (bubbleRef.current && !bubbleRef.current.contains(e.target as Node)) {
+        setShowCompleteBubble(false);
+      }
+    };
+    document.addEventListener("pointerdown", handle);
+    return () => document.removeEventListener("pointerdown", handle);
+  }, [showCompleteBubble]);
+
+  React.useEffect(() => () => {
+    if (removeTimeoutRef.current) clearTimeout(removeTimeoutRef.current);
+  }, []);
+
+  const snapOpen = React.useCallback(() => { setSnapped(true); setDragX(-BUTTON_AREA); }, []);
+  const snapClose = React.useCallback(() => { setSnapped(false); setDragX(0); }, []);
+
+  const triggerDelete = React.useCallback(() => {
+    setSnapped(false);
+    setIsRemoving(true);
+    setDragX(420);
+    removeTimeoutRef.current = setTimeout(() => onDelete(item.id), 180);
+  }, [item.id, onDelete]);
+
+  const handleQuickReturn = React.useCallback((date: string) => {
+    setSnapped(false);
+    setIsRemoving(true);
+    setDragX(-500);
+    removeTimeoutRef.current = setTimeout(() => onReturnToArrange(item.id, date), 180);
+  }, [item.id, onReturnToArrange]);
+
+  const metaLabel = formatLaterOriginalDateLabel(item.originalDate, item.originalTime);
+  const extraParts = [item.person, item.location].filter(Boolean) as string[];
+  const deleteHintOpacity = !snapped && dragX > 0 ? Math.min(1, dragX / 96) : 0;
+
+  return (
+    <div className="relative">
+      {/* 过去日程完成气泡 */}
+      {showCompleteBubble && (
+        <div
+          ref={bubbleRef}
+          style={bubbleStyle}
+          className="flex items-center gap-1 rounded-2xl border border-primary/15 bg-surface px-1.5 py-1.5 shadow-soft"
+        >
+          <button
+            type="button"
+            onClick={() => { setShowCompleteBubble(false); onComplete(item.id, item.originalDate); }}
+            className="rounded-xl px-3 py-1.5 text-[12px] text-text-muted transition hover:bg-surface-2 active:scale-[0.97]"
+          >
+            {"当时完成"}
+          </button>
+          <button
+            type="button"
+            onClick={() => { setShowCompleteBubble(false); onComplete(item.id); }}
+            className="rounded-xl bg-primary/10 px-3 py-1.5 text-[12px] text-primary transition hover:bg-primary/15 active:scale-[0.97]"
+          >
+            {"今天完成"}
+          </button>
+        </div>
+      )}
+
+      {/* 滑动区域 — overflow-hidden 裁掉卡片滑出左边的部分 */}
+      <div className="relative overflow-hidden rounded-[16px]">
+
+        {/* 右滑删除底层提示 */}
+        <div
+          className="absolute inset-0 flex items-center px-4"
+          style={{ opacity: deleteHintOpacity }}
+        >
+          <div className="absolute inset-0 bg-surface-2" />
+          <span className="relative text-[13px] text-text-muted">{"删除"}</span>
+        </div>
+
+        {/* 左滑快捷按钮（常驻，卡片滑走后露出） */}
+        <div className="absolute inset-y-0 right-0 flex items-center gap-1.5 pr-2">
+          <button
+            type="button"
+            onClick={() => handleQuickReturn(today)}
+            className="rounded-[10px] bg-[#d8f0e2] px-3 py-2 text-[13px] font-medium text-[#4a9464] transition active:scale-95"
+          >
+            {"今天"}
+          </button>
+          <button
+            type="button"
+            onClick={() => handleQuickReturn(tomorrow)}
+            className="rounded-[10px] bg-[#e8f4ec] px-3 py-2 text-[13px] font-medium text-[#5a9e72] transition active:scale-95"
+          >
+            {"明天"}
+          </button>
+          <button
+            type="button"
+            onClick={() => { snapClose(); onOpenSheet(); }}
+            className="rounded-[10px] bg-surface-2 px-3 py-2 text-[13px] font-medium text-text-muted transition active:scale-95"
+          >
+            {"选时间"}
+          </button>
+        </div>
+
+        {/* 卡片本体 — 滑动 */}
+        <article
+          data-later-card-id={item.id}
+          role="button"
+          tabIndex={0}
+          onClick={() => {
+            if (suppressClickRef.current) { suppressClickRef.current = false; return; }
+            if (snapped) { snapClose(); return; }
+            onOpenSheet();
+          }}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" || e.key === " ") { e.preventDefault(); if (!snapped) onOpenSheet(); }
+          }}
+          onPointerDown={(e) => {
+            if (isRemoving) return;
+            pointerStateRef.current = {
+              pointerId: e.pointerId,
+              startX: e.clientX,
+              startY: e.clientY,
+              startDragX: snapped ? -BUTTON_AREA : 0,
+              dragging: false,
+            };
+          }}
+          onPointerMove={(e) => {
+            const s = pointerStateRef.current;
+            if (!s || s.pointerId !== e.pointerId || isRemoving) return;
+            const dx = e.clientX - s.startX;
+            const dy = e.clientY - s.startY;
+            if (!s.dragging && Math.abs(dx) > 8 && Math.abs(dx) > Math.abs(dy)) s.dragging = true;
+            if (s.dragging) {
+              suppressClickRef.current = true;
+              const rawX = s.startDragX + dx;
+              if (snapped) {
+                // 卡住状态：只允许向右拖回，最多回到0
+                setDragX(Math.min(0, Math.max(rawX, -BUTTON_AREA - 16)));
+              } else {
+                // 自由状态：左→卡住区 / 右→删除提示
+                setDragX(Math.max(-BUTTON_AREA - 16, Math.min(140, rawX)));
+              }
+            }
+          }}
+          onPointerUp={(e) => {
+            const s = pointerStateRef.current;
+            if (!s || s.pointerId !== e.pointerId || isRemoving) return;
+            const dx = e.clientX - s.startX;
+            if (s.dragging) {
+              if (!snapped) {
+                if (dx > DELETE_THRESHOLD) triggerDelete();
+                else if (dx < -SNAP_THRESHOLD) snapOpen();
+                else snapClose();
+              } else {
+                // 卡住状态下：右滑超过阈值→回弹关闭
+                if (dx > CLOSE_THRESHOLD) snapClose();
+                else snapOpen(); // 弹回卡住位置
+              }
+            }
+            pointerStateRef.current = null;
+          }}
+          onPointerCancel={() => {
+            pointerStateRef.current = null;
+            if (snapped) snapOpen(); else snapClose();
+          }}
+          className={cn(
+            "relative w-full rounded-[16px] border border-primary/10 bg-surface px-4 py-2.5 shadow-soft outline-none",
+            "transition-[transform,opacity] duration-[200ms]",
+            "focus-visible:ring-2 focus-visible:ring-primary/20",
+            isRemoving && "pointer-events-none"
+          )}
+          style={{ transform: dragX !== 0 ? `translateX(${dragX}px)` : undefined, touchAction: "pan-y" }}
+        >
+          <div className="flex items-start gap-2.5">
+            {/* 勾选框 */}
+            <button
+              type="button"
+              aria-label="标记完成"
+              onClick={(e) => {
+                e.stopPropagation();
+                if (isPast) {
+                  const r = e.currentTarget.getBoundingClientRect();
+                  const bubbleH = 52; const gap = 8;
+                  if (r.top > bubbleH + gap + 56) {
+                    setBubbleStyle({ position: "fixed", left: r.left, top: r.top - bubbleH - gap, zIndex: 300 });
+                  } else {
+                    setBubbleStyle({ position: "fixed", left: r.left, top: r.bottom + gap, zIndex: 300 });
+                  }
+                  setShowCompleteBubble(true);
+                } else {
+                  onComplete(item.id);
+                }
+              }}
+              className="mt-0.5 flex h-[17px] w-[17px] shrink-0 items-center justify-center rounded-[4px] border border-border-strong bg-bg text-transparent transition active:scale-[0.97] hover:border-text-muted"
+            >
+              <svg width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                <path d="M3.5 8.5 6.5 11.5 12.5 4.5" />
+              </svg>
+            </button>
+
+            <div className="min-w-0 flex-1">
+              <h2 className="text-[14px] font-medium leading-[1.45] text-text">{item.title}</h2>
+              <div className="mt-0.5 flex flex-wrap items-center gap-x-1.5 gap-y-0 text-[11px] leading-[1.5] text-text-muted/70">
+                <span>{metaLabel}</span>
+                {extraParts.map((part) => (
+                  <React.Fragment key={part}>
+                    <span aria-hidden="true">{"·"}</span>
+                    <span>{part}</span>
+                  </React.Fragment>
+                ))}
+              </div>
+            </div>
+          </div>
+        </article>
+
+      </div>
+    </div>
+  );
+}
+
+// ─── LaterBottomSheet ─────────────────────────────────────────────────────────
+
+function LaterBottomSheet({
+  item,
+  onChange,
+  onClose,
+  onDelete,
+  onReturnToArrange,
+}: {
+  item: LaterItem;
+  onChange: (patch: Partial<LaterItem>) => void;
+  onClose: () => void;
+  onDelete: () => void;
+  onReturnToArrange: (date: string, time?: string) => void;
+}) {
+  const fieldClass = "w-full bg-transparent text-[14px] text-text outline-none placeholder:text-text-muted/40";
+  const labelClass = "mb-1 text-[10px] font-semibold uppercase tracking-wider text-text-muted/60";
+
+  const handleDateChange = (newDate: string) => {
+    onChange({ originalDate: newDate });
+    if (newDate) {
+      // 用户设置了明确时间 → 自动放回安排
+      onReturnToArrange(newDate, item.originalTime);
+    }
+  };
+
+  return (
+    <>
+      <div className="absolute inset-0 z-30 bg-black/25" onClick={onClose} />
+      <div className="absolute inset-0 z-40 flex items-center justify-center px-4 py-10">
+        <div className="flex w-full max-h-full flex-col rounded-[20px] bg-bg shadow-[0_8px_32px_rgba(0,0,0,0.18)]">
+          {/* 标题栏 */}
+          <div className="flex shrink-0 items-center justify-between px-5 pb-3 pt-4">
+            <h2 className="text-[16px] font-semibold text-text">{"安排详情"}</h2>
+            <button
+              type="button"
+              onClick={onClose}
+              className="flex h-7 w-7 items-center justify-center rounded-full bg-surface-2 text-text-muted transition active:scale-95"
+            >
+              <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round"><path d="M4 4L12 12M12 4L4 12" /></svg>
+            </button>
+          </div>
+
+          {/* 可滚动字段区 */}
+          <div className="min-h-0 flex-1 overflow-y-auto px-5 pb-2">
+            {/* 标题 */}
+            <div className="border-b border-border/50 py-3">
+              <div className={labelClass}>{"标题"}</div>
+              <input value={item.title} onChange={(e) => onChange({ title: e.target.value })} className={fieldClass + " text-[15px] font-medium"} placeholder={"安排标题"} />
+            </div>
+            {/* 日期（改为非空即放回） */}
+            <div className="grid grid-cols-2 gap-4 border-b border-border/50 py-3">
+              <div>
+                <div className={labelClass}>{"日期"}</div>
+                <input
+                  type="date"
+                  value={item.originalDate ?? ""}
+                  onChange={(e) => handleDateChange(e.target.value)}
+                  className={fieldClass}
+                />
+              </div>
+              <div>
+                <div className={labelClass}>{"时间"}</div>
+                <input
+                  type="time"
+                  value={normalizeClockTime(item.originalTime) ?? ""}
+                  onChange={(e) => onChange({ originalTime: e.target.value || undefined })}
+                  className={fieldClass}
+                />
+              </div>
+            </div>
+            {/* 关联人 */}
+            <div className="border-b border-border/50 py-3">
+              <div className={labelClass}>{"关联人"}</div>
+              <input value={item.person ?? ""} onChange={(e) => onChange({ person: e.target.value || undefined })} className={fieldClass} placeholder={"无"} />
+            </div>
+            {/* 地点 */}
+            <div className="border-b border-border/50 py-3">
+              <div className={labelClass}>{"地点"}</div>
+              <input value={item.location ?? ""} onChange={(e) => onChange({ location: e.target.value || undefined })} className={fieldClass} placeholder={"无"} />
+            </div>
+            {/* 备注 */}
+            <div className={item.sourceContext ? "border-b border-border/50 py-3" : "py-3"}>
+              <div className={labelClass}>{"备注"}</div>
+              <textarea value={item.note ?? ""} onChange={(e) => onChange({ note: e.target.value || undefined })} rows={3} className={fieldClass + " resize-none leading-relaxed"} placeholder={"添加备注…"} />
+            </div>
+            {/* 来源（只读） */}
+            {item.sourceContext && (
+              <ArrangeSourceContextBlock sourceContext={item.sourceContext} labelClass={labelClass} />
+            )}
+            {/* 提示：设置日期后自动放回 */}
+            <p className="pb-2 text-[11px] text-text-muted/50">{"设置日期后，该安排会自动放回主时间轴"}</p>
+          </div>
+
+          {/* 底部操作栏：仅删除 */}
+          <div className="flex shrink-0 items-center justify-end border-t border-border/50 px-6 py-4">
+            <button
+              type="button"
+              onClick={onDelete}
+              className="text-[14px] text-text-muted/70 transition active:scale-95"
+            >
+              {"删除"}
+            </button>
+          </div>
+        </div>
+      </div>
+    </>
+  );
+}
+
+// ─── ArrangeToast ─────────────────────────────────────────────────────────────
+
+function ArrangeToast({
+  message,
+  onUndo,
+  onDismiss,
+}: {
+  message: string;
+  onUndo: () => void;
+  onDismiss: () => void;
+}) {
+  React.useEffect(() => {
+    const t = setTimeout(onDismiss, 4000);
+    return () => clearTimeout(t);
+  }, [onDismiss]);
+
+  const dotIdx = message.indexOf(" \u00b7 ");
+  const statusText = dotIdx >= 0 ? message.slice(0, dotIdx) : message;
+  const actionText = dotIdx >= 0 ? message.slice(dotIdx + 3) : null;
+
+  return (
+    <div className="absolute bottom-[76px] left-1/2 z-50 flex -translate-x-1/2 items-center gap-3 rounded-full bg-[#adadad] px-4 py-2.5 shadow-[0_4px_16px_rgba(0,0,0,0.14)]">
+      <span className="whitespace-nowrap text-[13px] text-white">{statusText}</span>
+      {actionText && (
+        <>
+          <div className="h-3 w-px bg-white/40" />
+          <button
+            type="button"
+            onClick={onUndo}
+            className="whitespace-nowrap text-[13px] font-semibold text-[#8adcaa] transition active:opacity-70"
+          >
+            {actionText}
+          </button>
+        </>
+      )}
+    </div>
   );
 }
 
@@ -3430,8 +5505,50 @@ function ThemePreview({ mode }: { mode: ResolvedTheme }) {
 
 function getTabLabel(page: PageType, t: ReturnType<typeof usePreferences>["t"]) {
   if (page === "records") return t("tabs.records");
+  if (page === "arrange") return t("tabs.arrange");
   if (page === "insight") return t("tabs.insight");
   return t("tabs.mine");
+}
+
+function TabIcon({ page, active }: { page: PageType; active: boolean }) {
+  const className = cn(
+    "h-[18px] w-[18px]",
+    active ? "text-text" : "text-text-tertiary"
+  );
+
+  if (page === "records") {
+    return (
+      <svg className={className} viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+        <path d="M7 6.75H17M7 12H17M7 17.25H13" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+        <path d="M4.75 6.75H4.76M4.75 12H4.76M4.75 17.25H4.76" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" />
+      </svg>
+    );
+  }
+
+  if (page === "arrange") {
+    return (
+      <svg className={className} viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+        <rect x="4.5" y="6" width="15" height="13.5" rx="3" stroke="currentColor" strokeWidth="1.8" />
+        <path d="M8 4.75V7.25M16 4.75V7.25M4.5 10H19.5" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+      </svg>
+    );
+  }
+
+  if (page === "insight") {
+    return (
+      <svg className={className} viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+        <path d="M6 16.5L10 12.5L13 15.5L18 9" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+        <path d="M18 9H14.75M18 9V12.25" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+      </svg>
+    );
+  }
+
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+      <path d="M12 12C14.2091 12 16 10.2091 16 8C16 5.79086 14.2091 4 12 4C9.79086 4 8 5.79086 8 8C8 10.2091 9.79086 12 12 12Z" stroke="currentColor" strokeWidth="1.8" />
+      <path d="M5.5 19.5C6.7 16.9 9.05 15.5 12 15.5C14.95 15.5 17.3 16.9 18.5 19.5" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+    </svg>
+  );
 }
 
 function getJiwoLogoSrc(appIcon: AppIcon, resolvedTheme: ResolvedTheme) {

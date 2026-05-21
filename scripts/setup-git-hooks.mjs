@@ -7,6 +7,21 @@ const gitDir = resolve(".git");
 const hooksDir = ".githooks";
 const prePushHook = resolve(hooksDir, "pre-push");
 
+function normalizeHooksPath(value) {
+  return value.trim().replace(/\\/g, "/").replace(/^\.\//, "");
+}
+
+function readLocalHooksPath() {
+  try {
+    return execFileSync("git", ["config", "--local", "--get", "core.hooksPath"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+  } catch {
+    return "";
+  }
+}
+
 function fail(message) {
   console.error(`git hook setup failed: ${message}`);
   process.exit(1);
@@ -23,6 +38,13 @@ if (!existsSync(prePushHook)) {
 
 try {
   chmodSync(prePushHook, 0o755);
+
+  const currentHooksPath = readLocalHooksPath();
+  if (normalizeHooksPath(currentHooksPath) === normalizeHooksPath(hooksDir)) {
+    console.log("git hooks already installed: pre-push will run pnpm verify:answer");
+    process.exit(0);
+  }
+
   execFileSync("git", ["config", "--local", "core.hooksPath", hooksDir], {
     stdio: "inherit",
   });
