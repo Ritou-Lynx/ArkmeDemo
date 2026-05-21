@@ -3818,7 +3818,7 @@ function ArrangePreview({
         </div>
       )}
 
-      <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto pb-16">
+      <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto pb-16 mobile-scroll">
         <div className="relative mx-auto min-h-full max-w-[430px] px-4 pb-10 pt-4">
           <div className="pointer-events-none absolute bottom-0 left-[40px] top-0 z-0 w-px bg-primary opacity-30" />
 
@@ -4346,7 +4346,7 @@ function LaterPage({
   return (
     <div className="flex h-full flex-col bg-[linear-gradient(180deg,var(--primary-soft)_0%,var(--bg)_18%,var(--bg)_100%)]">
       {/* 列表 */}
-      <div className="min-h-0 flex-1 overflow-y-auto pb-16">
+      <div className="min-h-0 flex-1 overflow-y-auto pb-16 mobile-scroll">
         {sorted.length === 0 ? (
           <div className="flex flex-col items-center justify-center px-8 pt-24 text-center">
             <p className="text-[15px] font-medium text-text-muted/60">{"暂时没有放在这里的安排"}</p>

@@ -391,3 +391,12 @@ textarea {
 .stagger-8 { animation-delay: 240ms; }
 .stagger-9 { animation-delay: 270ms; }
 .stagger-10 { animation-delay: 300ms; }
+
+/* 隐藏移动端页面容器的可见滚动条，保留滚动能力 */
+.mobile-scroll {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+.mobile-scroll::-webkit-scrollbar {
+  display: none;
+}
