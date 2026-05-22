@@ -31,12 +31,12 @@ export async function recognizeArrangementFromQuickNoteByLLM(
 
   switch (config.provider) {
     case "openai-compatible":
-      return callOpenAICompatibleRecognition(text, config);
-    case "anthropic":
-    case "gemini":
     case "deepseek":
     case "qwen":
     case "custom":
+      return callOpenAICompatibleRecognition(text, config);
+    case "anthropic":
+    case "gemini":
       return callReservedProviderRecognition(config);
   }
 }

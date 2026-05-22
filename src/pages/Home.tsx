@@ -1,4 +1,5 @@
 import React from "react";
+import { createPortal } from "react-dom";
 import AppShell from "@/layouts/AppShell";
 import ChatBubble from "@/components/ChatBubble";
 import ChatInput from "@/components/ChatInput";
@@ -34,6 +35,9 @@ import { formatBubbleTime, formatTimeLabel } from "@/lib/time";
 import {
   readLLMConfigFromStorage,
   recognizeArrangementFromQuickNoteByLLM,
+  writeLLMConfigToStorage,
+  type LLMConfig,
+  type LLMProvider,
   type RecognizeArrangementResult,
 } from "@/lib/llm";
 import { cn } from "@/lib/utils";
@@ -846,7 +850,7 @@ export default function Home({ currentPage, onNavigate }: HomeProps) {
   const [sendToSelfTargetUid, setSendToSelfTargetUid] = React.useState<string | null>(null);
   const [activeTestIdentityId, setActiveTestIdentityId] = React.useState<string | null>(null);
   const [testConversationTargetUid, setTestConversationTargetUid] = React.useState<string | null>(null);
-  const [settingsView, setSettingsView] = React.useState<null | "settings" | "appearance" | "about">(
+  const [settingsView, setSettingsView] = React.useState<null | "settings" | "appearance" | "about" | "aiConfig">(
     null
   );
   const [searchQuery, setSearchQuery] = React.useState("");
@@ -1965,11 +1969,16 @@ export default function Home({ currentPage, onNavigate }: HomeProps) {
       return <AboutScreen onBack={() => setSettingsView(null)} />;
     }
 
+    if (settingsView === "aiConfig") {
+      return <AISettingsScreen onBack={() => setSettingsView("settings")} />;
+    }
+
     if (settingsView === "settings") {
       return (
         <SettingsScreen
           onBack={() => setSettingsView(null)}
           onOpenAppearance={() => setSettingsView("appearance")}
+          onOpenAiConfig={() => setSettingsView("aiConfig")}
         />
       );
     }
@@ -2045,18 +2054,6 @@ export default function Home({ currentPage, onNavigate }: HomeProps) {
     }
 
     if (currentPage === "arrange") {
-      const toastNode = arrangeToast ? (
-        <ArrangeToast
-          key={arrangeToast.key}
-          message={arrangeToast.message}
-          onUndo={undoLastArrangeAction}
-          onDismiss={() => {
-            if (arrangeToastTimerRef.current) clearTimeout(arrangeToastTimerRef.current);
-            setArrangeToast(null);
-          }}
-        />
-      ) : null;
-
       return (
         <div className="relative flex h-full flex-col overflow-hidden">
           {/* ── 共享 Tab 栏：始终静止，不参与滑动 ── */}
@@ -2083,13 +2080,6 @@ export default function Home({ currentPage, onNavigate }: HomeProps) {
                 }
               >
                 {"以后再说"}
-              </button>
-              <button
-                type="button"
-                disabled
-                className="cursor-default rounded-full px-4 py-1.5 text-[13px] font-medium text-text-muted/35"
-              >
-                {"日历"}
               </button>
             </div>
           </header>
@@ -2160,7 +2150,6 @@ export default function Home({ currentPage, onNavigate }: HomeProps) {
               onReturnToArrange={(date, time) => returnLaterItemToArrange(laterSheetItem, date, time)}
             />
           )}
-          {toastNode}
         </div>
       );
     }
@@ -2198,11 +2187,24 @@ export default function Home({ currentPage, onNavigate }: HomeProps) {
     );
   };
 
+  const toastNode = arrangeToast ? (
+    <ArrangeToast
+      key={arrangeToast.key}
+      message={arrangeToast.message}
+      onUndo={undoLastArrangeAction}
+      onDismiss={() => {
+        if (arrangeToastTimerRef.current) clearTimeout(arrangeToastTimerRef.current);
+        setArrangeToast(null);
+      }}
+    />
+  ) : null;
+
   return (
     <AppShell
       mainPane={
         <div className="relative flex min-h-0 flex-1 flex-col">
           <main className="min-h-0 flex-1 overflow-hidden">{renderMainContent()}</main>
+          {toastNode}
           {!recordDetail && !showSearch && !showAnswerGuide && !showAiConversation && !showSendToSelf && !showTestConversation && !settingsView && (
             <MobileBottomNavigation currentPage={currentPage} onNavigate={onNavigate} />
           )}
@@ -4454,8 +4456,8 @@ function LaterListCard({
 
   return (
     <div className="relative">
-      {/* 过去日程完成气泡 */}
-      {showCompleteBubble && (
+      {/* 过去日程完成气泡 — Portal 到 body 以避免父级 transform 截断 position:fixed */}
+      {showCompleteBubble && createPortal(
         <div
           ref={bubbleRef}
           style={bubbleStyle}
@@ -4475,7 +4477,8 @@ function LaterListCard({
           >
             {"今天完成"}
           </button>
-        </div>
+        </div>,
+        document.body
       )}
 
       {/* 滑动区域 — overflow-hidden 裁掉卡片滑出左边的部分 */}
@@ -5185,9 +5188,11 @@ function MineActionCard({
 function SettingsScreen({
   onBack,
   onOpenAppearance,
+  onOpenAiConfig,
 }: {
   onBack: () => void;
   onOpenAppearance: () => void;
+  onOpenAiConfig: () => void;
 }) {
   const { localeCode, resolvedLocale, t } = usePreferences();
   const [showLanguageSheet, setShowLanguageSheet] = React.useState(false);
@@ -5204,6 +5209,11 @@ function SettingsScreen({
             onClick={onOpenAppearance}
           />
           <SettingsListItem
+            title={t("settings.aiInterface")}
+            description={t("settings.aiInterfaceDesc")}
+            onClick={onOpenAiConfig}
+          />
+          <SettingsListItem
             title={t("settings.language")}
             description={`${t("settings.current")}：${
               localeCode === ""
@@ -5218,6 +5228,147 @@ function SettingsScreen({
       {showLanguageSheet && (
         <LanguageSheet onClose={() => setShowLanguageSheet(false)} />
       )}
+    </div>
+  );
+}
+
+type ProviderPreset = {
+  provider: LLMProvider;
+  label: string;
+  defaultBaseUrl: string;
+  defaultModel: string;
+};
+
+const providerPresets: ProviderPreset[] = [
+  { provider: "openai-compatible", label: "OpenAI", defaultBaseUrl: "https://api.openai.com/v1", defaultModel: "gpt-4o-mini" },
+  { provider: "deepseek", label: "DeepSeek", defaultBaseUrl: "https://api.deepseek.com/v1", defaultModel: "deepseek-chat" },
+  { provider: "anthropic", label: "Anthropic", defaultBaseUrl: "https://api.anthropic.com/v1", defaultModel: "claude-haiku-3-5-20241022" },
+  { provider: "gemini", label: "Gemini", defaultBaseUrl: "https://generativelanguage.googleapis.com/v1beta", defaultModel: "gemini-2.0-flash" },
+  { provider: "qwen", label: "通义千问", defaultBaseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1", defaultModel: "qwen-turbo" },
+  { provider: "custom", label: "自定义", defaultBaseUrl: "", defaultModel: "" },
+];
+
+function AISettingsScreen({ onBack }: { onBack: () => void }) {
+  const { t } = usePreferences();
+  const existingConfig = React.useMemo(() => readLLMConfigFromStorage(), []);
+
+  const [provider, setProvider] = React.useState<LLMProvider>(existingConfig.provider);
+  const [apiKey, setApiKey] = React.useState(existingConfig.apiKey ?? "");
+  const [baseUrl, setBaseUrl] = React.useState(existingConfig.baseUrl ?? "");
+  const [model, setModel] = React.useState(existingConfig.model ?? "");
+  const [showApiKey, setShowApiKey] = React.useState(false);
+  const [saved, setSaved] = React.useState(false);
+
+  const handleProviderChange = (newProvider: LLMProvider) => {
+    setProvider(newProvider);
+    const preset = providerPresets.find((p) => p.provider === newProvider);
+    if (preset) {
+      setBaseUrl(preset.defaultBaseUrl);
+      setModel(preset.defaultModel);
+    }
+    setSaved(false);
+  };
+
+  const handleSave = () => {
+    const config: LLMConfig = {
+      provider,
+      apiKey: apiKey.trim() || undefined,
+      baseUrl: baseUrl.trim() || undefined,
+      model: model.trim() || undefined,
+    };
+    writeLLMConfigToStorage(config);
+    setSaved(true);
+  };
+
+  return (
+    <div className="relative flex h-full flex-col bg-bg">
+      <MobilePageHeader title={t("aiConfig.title")} onBack={onBack} />
+
+      <div className="min-h-0 flex-1 overflow-y-auto px-3 pb-5 pt-3">
+        <section className="rounded-[12px] bg-surface px-3 pb-3 pt-3">
+          <h2 className="text-[15px] font-semibold leading-5 text-text">
+            {t("aiConfig.providerLabel")}
+          </h2>
+          <div className="mt-3 grid grid-cols-3 gap-2">
+            {providerPresets.map((preset) => (
+              <button
+                key={preset.provider}
+                type="button"
+                onClick={() => handleProviderChange(preset.provider)}
+                className={cn(
+                  "rounded-[10px] border px-2 pb-2 pt-2 text-center text-[13px] font-medium transition active:scale-[0.98]",
+                  provider === preset.provider
+                    ? "border-primary bg-primary-soft text-text"
+                    : "border-border bg-surface text-text-muted"
+                )}
+              >
+                {preset.label}
+              </button>
+            ))}
+          </div>
+        </section>
+
+        <section className="mt-3 rounded-[12px] bg-surface px-3 pb-3 pt-3">
+          <h2 className="text-[15px] font-semibold leading-5 text-text">
+            {t("aiConfig.apiKeyLabel")}
+          </h2>
+          <div className="mt-2 flex items-center gap-2">
+            <input
+              type={showApiKey ? "text" : "password"}
+              value={apiKey}
+              onChange={(e) => { setApiKey(e.target.value); setSaved(false); }}
+              placeholder={t("aiConfig.apiKeyPlaceholder")}
+              className="min-w-0 flex-1 rounded-lg border border-border bg-bg px-3 py-2.5 text-[14px] text-text placeholder:text-text-disabled focus:border-primary focus:outline-none"
+            />
+            <button
+              type="button"
+              onClick={() => setShowApiKey((v) => !v)}
+              className="shrink-0 rounded-lg px-2.5 py-2.5 text-[13px] text-text-muted transition active:scale-[0.96]"
+            >
+              {showApiKey ? "隐藏" : "显示"}
+            </button>
+          </div>
+        </section>
+
+        <section className="mt-3 rounded-[12px] bg-surface px-3 pb-3 pt-3">
+          <h2 className="text-[15px] font-semibold leading-5 text-text">
+            {t("aiConfig.baseUrlLabel")}
+          </h2>
+          <input
+            type="text"
+            value={baseUrl}
+            onChange={(e) => { setBaseUrl(e.target.value); setSaved(false); }}
+            placeholder={t("aiConfig.baseUrlPlaceholder")}
+            className="mt-2 w-full rounded-lg border border-border bg-bg px-3 py-2.5 text-[14px] text-text placeholder:text-text-disabled focus:border-primary focus:outline-none"
+          />
+        </section>
+
+        <section className="mt-3 rounded-[12px] bg-surface px-3 pb-3 pt-3">
+          <h2 className="text-[15px] font-semibold leading-5 text-text">
+            {t("aiConfig.modelLabel")}
+          </h2>
+          <input
+            type="text"
+            value={model}
+            onChange={(e) => { setModel(e.target.value); setSaved(false); }}
+            placeholder={t("aiConfig.modelPlaceholder")}
+            className="mt-2 w-full rounded-lg border border-border bg-bg px-3 py-2.5 text-[14px] text-text placeholder:text-text-disabled focus:border-primary focus:outline-none"
+          />
+        </section>
+
+        <button
+          type="button"
+          onClick={handleSave}
+          className={cn(
+            "mt-5 w-full rounded-xl py-3 text-[15px] font-semibold transition active:scale-[0.98]",
+            saved
+              ? "bg-[#8adcaa] text-white"
+              : "bg-primary text-white"
+          )}
+        >
+          {saved ? t("aiConfig.savedToast") : t("aiConfig.save")}
+        </button>
+      </div>
     </div>
   );
 }
